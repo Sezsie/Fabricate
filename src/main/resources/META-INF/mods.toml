@@ -4,7 +4,7 @@ license="All Rights Reserved"
 
 [[mods]]
 modId="fabricate"
-version="1.1.6"
+version="${mod_version}"
 displayName="Fabricate"
 description='''Craft your items using base materials!'''
 

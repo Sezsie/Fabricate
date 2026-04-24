@@ -24,8 +24,11 @@ public class Fabricate {
     public static final Logger LOGGER = LogManager.getLogger();
 
     public Fabricate() {
+        String version = ModList.get().getModContainerById(MOD_ID)
+                .map(c -> c.getModInfo().getVersion().toString())
+                .orElse("unknown");
         LOGGER.info("==================== Fabricate booting ====================");
-        LOGGER.info("[FAB] dist={}, version=1.0.0", FMLEnvironment.dist);
+        LOGGER.info("[FAB] dist={}, version={}", FMLEnvironment.dist, version);
 
         LOGGER.info("[FAB] registering config specs (common + client)");
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, com.sabbs.fabricate.ModConfig.SPEC);
