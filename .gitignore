@@ -1,0 +1,39 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# Forge dev environment
+run/
+
+# IDE metadata
+.idea/
+.vscode/
+.eclipse/
+*.iml
+*.ipr
+*.iws
+*.launch
+bin/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Stray class output
+/com/
+
+# Local backups
+.backup-*/
+
+# Claude session data
+.claude/
+
+# Build artifacts at root
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Logs
+*.log

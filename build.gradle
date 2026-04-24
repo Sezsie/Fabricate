@@ -1,0 +1,115 @@
+buildscript {
+    repositories {
+        maven { url = 'https://maven.minecraftforge.net/' }
+        maven { url = 'https://repo.spongepowered.org/repository/maven-public/' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath group: 'org.spongepowered', name: 'mixingradle', version: '0.7.+'
+    }
+}
+
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0.16,6.2)'
+}
+
+apply plugin: 'org.spongepowered.mixin'
+
+mixin {
+    add sourceSets.main, 'fabricate.refmap.json'
+    config 'fabricate.mixins.json'
+}
+
+version = '1.1.7-indev'
+group = 'com.sabbs.fabricate'
+
+base {
+    archivesName = 'fabricate'
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+
+            // Remap SRG refmaps from dependency mods to official names in dev
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${project.buildDir}/createSrgToMcp/output.srg"
+
+            mods {
+                fabricate {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', 'fabricate'
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', 'fabricate'
+            args '--nogui'
+        }
+    }
+}
+
+repositories {
+    maven {
+        name = "CurseMaven"
+        url = "https://cursemaven.com"
+    }
+    mavenLocal()
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.3.0'
+
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
+    // Polymorph compileOnly for API access, runtimeOnly so it loads in dev.
+    compileOnly fg.deobf('curse.maven:polymorph-388800:6450982')
+    runtimeOnly fg.deobf('curse.maven:polymorph-388800:6450982')
+
+    // Recipe viewers compileOnly for API access, runtimeOnly for dev testing.
+    compileOnly fg.deobf('curse.maven:emi-580555:6420945')
+    compileOnly fg.deobf('curse.maven:jei-238222:7391695')
+    runtimeOnly fg.deobf('curse.maven:emi-580555:6420945')
+    runtimeOnly fg.deobf('curse.maven:jei-238222:7391695')
+
+    // Configured in-game config UI, dev-only. No API usage on our side.
+    // 5180900 = Configured 2.2.3 for 1.20.1 Forge.
+    runtimeOnly fg.deobf('curse.maven:configured-457570:5180900')
+}
+
+jar {
+    manifest {
+        attributes([
+            "Specification-Title"     : "fabricate",
+            "Specification-Vendor"    : "sabby",
+            "Specification-Version"   : "1",
+            "Implementation-Title"    : project.name,
+            "Implementation-Version"  : project.jar.archiveVersion,
+            "Implementation-Vendor"   : "sabby",
+            "Implementation-Timestamp": new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+            "MixinConfigs"            : "fabricate.mixins.json"
+        ])
+    }
+}
+
+jar.finalizedBy('reobfJar')
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

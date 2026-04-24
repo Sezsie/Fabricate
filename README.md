@@ -1,2 +1,2 @@
 # Fabricate
-Crat items directly using base materials!
+Craft any item directly from base materials!
