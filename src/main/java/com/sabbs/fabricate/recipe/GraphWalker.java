@@ -1,14 +1,23 @@
 package com.sabbs.fabricate.recipe;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
 import com.sabbs.fabricate.Fabricate;
+
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraftforge.registries.ForgeRegistries;
-
-import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Walks the recipe graph finding all reachable products and generating
@@ -118,12 +127,63 @@ public class GraphWalker {
         int recipesExamined = 0;
         int recipesWithMultiIng = 0;
 
+        // Pre-compute the set of items that actually appear as an ingredient
+        // in some recipe. Folding multi-base synthetics whose output is never
+        // used as an ingredient (terminal outputs like comparator itself) is
+        // wasted work and only inflates productionMap.
+        Set<Item> usedAsIngredient = new HashSet<>();
+        for (Item out : index.getAllOutputItems()) {
+            for (Recipe<?> r : index.getRecipesProducing(out)) {
+                for (Ingredient ing : r.getIngredients()) {
+                    if (ing.isEmpty()) continue;
+                    for (ItemStack is : ing.getItems()) {
+                        if (!is.isEmpty()) usedAsIngredient.add(is.getItem());
+                    }
+                }
+            }
+        }
+
+        // Iterate phase 2: each pass can produce multi-base synthetics that
+        // feed back into productionMap as substitutes for the next pass. This
+        // is what unlocks recipes whose vanilla form requires an intermediate
+        // that itself needs 2+ base types (comparator needs redstone_torch =
+        // stick+redstone, etc.) and chains of those (a recipe needing
+        // comparator as ingredient, etc.).
+        //
+        // Safety: MAX_PRODUCERS_PER_ITEM is a GLOBAL cap on productionMap
+        // entries per item, applied after every fold. This bounds per-slot
+        // option count regardless of iteration depth, so iteration count
+        // costs linear extra work (one more outer-loop pass), not
+        // exponential blow-up.
+        final int MAX_ITERATIONS = 5;
+        final int MAX_PRODUCERS_PER_ITEM = 3;
+        int prevBestSize = -1;
+        int iteration = 0;
+
+        // Parallel id-set per item for O(1) fold-back dedup. Using
+        // List.contains on SyntheticRecipe triggers the record's
+        // auto-generated deep equals (recursively compares baseCosts Map
+        // and refundItems List<ItemStack>), which on a large modpack
+        // cumulatively exceeds the 60s ServerHangWatchdog budget across
+        // 5 iterations. generateId() returns a String, so HashSet
+        // operations are O(1) amortized.
+        Map<Item, Set<String>> producerIds = new HashMap<>();
+        for (var entry : productionMap.entrySet()) {
+            Set<String> ids = new HashSet<>();
+            for (SyntheticRecipe s : entry.getValue()) ids.add(s.generateId());
+            producerIds.put(entry.getKey(), ids);
+        }
+        while (iteration < MAX_ITERATIONS && best.size() != prevBestSize) {
+            prevBestSize = best.size();
+            iteration++;
+            boolean firstPass = (iteration == 1);
+
         for (Item outputItem : index.getAllOutputItems()) {
             for (Recipe<?> recipe : index.getRecipesProducing(outputItem)) {
-                recipesExamined++;
+                if (firstPass) recipesExamined++;
                 Map<Item, Integer> ingredients = flattenVanillaIngredients(recipe, allBaseItems);
                 if (ingredients == null || ingredients.size() < 2) continue;
-                recipesWithMultiIng++;
+                if (firstPass) recipesWithMultiIng++;
 
                 // Build map: chosen item → all items accepted by the original tag/ingredient.
                 // This lets us find producers for ALL tag members (e.g., all plank types),
@@ -168,18 +228,20 @@ public class GraphWalker {
                     }
 
                     // Option B: substitute with producers from ALL tag members.
+                    // Multi-base producers are allowed so an ingredient like
+                    // redstone_torch (which itself decomposes to stick+redstone)
+                    // can be substituted, enabling synthetics for outputs whose
+                    // vanilla recipe contains intermediates with 2+ base types
+                    // (comparator, blaze rod compounds, paper variants, ...).
+                    // Dedup by record identity  SyntheticRecipe is a value
+                    // type, so equal cost+output+refunds collapse naturally.
                     Set<Item> searchItems = tagMembers.getOrDefault(ing, Set.of(ing));
-                    Map<Item, SyntheticRecipe> bestProducers = new HashMap<>();
+                    Set<SyntheticRecipe> bestProducers = new LinkedHashSet<>();
                     for (Item searchItem : searchItems) {
-                        for (SyntheticRecipe producer : productionMap.getOrDefault(searchItem, List.of())) {
-                            if (producer.baseCosts().size() != 1) continue;
-                            Item base = producer.baseCosts().keySet().iterator().next();
-                            bestProducers.merge(base, producer, (old, neu) ->
-                                neu.totalInputCount() < old.totalInputCount() ? neu : old);
-                        }
+                        bestProducers.addAll(productionMap.getOrDefault(searchItem, List.of()));
                     }
 
-                    bestProducers.values().stream()
+                    bestProducers.stream()
                         .sorted(Comparator.comparingInt(SyntheticRecipe::totalInputCount))
                         .forEach(producer -> {
                             int synOutputCount = producer.output().getCount();
@@ -206,13 +268,19 @@ public class GraphWalker {
                 }
 
                 if (tooMany) continue;
-                // Skip recipes with too many ingredient types
-                if (ingItems.size() > 4) continue;
-                // Guard against combinatorial explosion from tag-expanded options
+                // Skip recipes with too many ingredient types. Matches the
+                // 9-base-material cap in generateCombinations so the source
+                // ceiling and the synthetic ceiling agree.
+                if (ingItems.size() > 9) continue;
+                // Guard against combinatorial explosion from tag-expanded
+                // options. Bumped from 50k to 200k to give 6-9-ingredient
+                // recipes room to fully enumerate (worst realistic case
+                // ~4^9 = 262k, but the prune in generateCombinations cuts
+                // most of that subtree).
                 long totalCombinations = 1;
                 for (List<SubOption> opts : allOptions) {
                     totalCombinations *= opts.size();
-                    if (totalCombinations > 50000) { tooMany = true; break; }
+                    if (totalCombinations > 200000) { tooMany = true; break; }
                 }
                 if (tooMany) continue;
 
@@ -223,8 +291,42 @@ public class GraphWalker {
             }
         }
 
-        Fabricate.LOGGER.info("Fabricate Multi: examined {} recipes, {} had 2+ ingredient types, generated {} multi-material recipes",
-            recipesExamined, recipesWithMultiIng, best.size());
+            // Fold this iteration's results into productionMap so the next
+            // pass can substitute them, but only for outputs that are
+            // actually used as ingredients elsewhere. Then trim each
+            // affected item's full producer list to MAX_PRODUCERS_PER_ITEM
+            // cheapest globally. This is what makes raising MAX_ITERATIONS
+            // safe: per-slot option count stays bounded across all passes.
+            Set<Item> touchedOutputs = new HashSet<>();
+            for (SyntheticRecipe syn : best.values()) {
+                Item out = syn.output().getItem();
+                if (!usedAsIngredient.contains(out)) continue;
+                Set<String> ids = producerIds.computeIfAbsent(out, k -> new HashSet<>());
+                if (ids.add(syn.generateId())) {
+                    productionMap.computeIfAbsent(out, k -> new ArrayList<>()).add(syn);
+                }
+                touchedOutputs.add(out);
+            }
+            int trimmed = 0;
+            for (Item out : touchedOutputs) {
+                List<SyntheticRecipe> producers = productionMap.get(out);
+                if (producers == null || producers.size() <= MAX_PRODUCERS_PER_ITEM) continue;
+                producers.sort(Comparator.comparingInt(SyntheticRecipe::totalInputCount));
+                int over = producers.size() - MAX_PRODUCERS_PER_ITEM;
+                producers.subList(MAX_PRODUCERS_PER_ITEM, producers.size()).clear();
+                // Resync id-set with the trimmed list so future passes
+                // don't see ghost ids for entries we just dropped.
+                Set<String> ids = producerIds.computeIfAbsent(out, k -> new HashSet<>());
+                ids.clear();
+                for (SyntheticRecipe s : producers) ids.add(s.generateId());
+                trimmed += over;
+            }
+            Fabricate.LOGGER.info("[FAB-gen] phase 2 iteration {}: {} multi-material synthetics (delta={}, trimmed={})",
+                iteration, best.size(), best.size() - prevBestSize, trimmed);
+        }
+
+        Fabricate.LOGGER.info("Fabricate Multi: examined {} recipes, {} had 2+ ingredient types, generated {} multi-material recipes ({} iterations)",
+            recipesExamined, recipesWithMultiIng, best.size(), iteration);
         return new ArrayList<>(best.values());
     }
 

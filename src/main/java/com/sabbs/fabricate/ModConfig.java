@@ -11,9 +11,9 @@ public class ModConfig {
     public static final ForgeConfigSpec CLIENT_SPEC;
 
     // Client-only: master switch for every client-facing feature of this mod.
-    // When false, synthetic recipes are hidden from JEI, click-to-craft inputs
-    // are ignored, Polymorph's recipe selector isn't enhanced, and the
-    // client-side recipe-regen pass on RecipesUpdatedEvent skips injection.
+    // When false, synthetic recipes are hidden from EMI/JEI, click-to-craft
+    // inputs are ignored, and the client-side recipe-regen pass on
+    // RecipesUpdatedEvent skips injection.
     public static final ForgeConfigSpec.BooleanValue CLIENT_ENABLED;
 
     // General
@@ -29,11 +29,6 @@ public class ModConfig {
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>> BLACKLISTED_OUTPUT_ITEMS;
     public static final ForgeConfigSpec.ConfigValue<List<? extends String>> WHITELISTED_BASE_ITEMS;
     public static final ForgeConfigSpec.BooleanValue USE_BASE_ITEM_WHITELIST;
-
-    // Polymorph
-    public static final ForgeConfigSpec.BooleanValue ENABLE_SCROLL;
-    public static final ForgeConfigSpec.IntValue SCROLL_STEP;
-    public static final ForgeConfigSpec.IntValue MAX_VISIBLE_RECIPES;
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -114,35 +109,14 @@ public class ModConfig {
         }
         builder.pop();
 
-        builder.comment("Polymorph Integration",
-                        "Settings for scrolling through recipes in the Polymorph selection menu.")
-                .push("polymorph");
-        {
-            ENABLE_SCROLL = builder
-                .comment("Enable mouse wheel scrolling through the Polymorph recipe list.",
-                         "Scroll down to move left, scroll up to move right.")
-                .define("enableScroll", true);
-
-            SCROLL_STEP = builder
-                .comment("Number of recipes to scroll per mouse wheel tick.")
-                .defineInRange("scrollStep", 1, 1, 10);
-
-            MAX_VISIBLE_RECIPES = builder
-                .comment("Maximum number of recipe buttons visible at once in the Polymorph menu.",
-                         "Recipes beyond this count can be reached by scrolling.",
-                         "Set to 0 for no limit (you probably dont want this).")
-                .defineInRange("maxVisibleRecipes", 7, 0, 10);
-        }
-        builder.pop();
-
         SPEC = builder.build();
 
         ForgeConfigSpec.Builder clientBuilder = new ForgeConfigSpec.Builder();
         clientBuilder.comment("Client-side settings").push("client");
         CLIENT_ENABLED = clientBuilder
             .comment("Master switch for every Fabricate client-side feature.",
-                     "Set to false to disable synthetic recipes in your recipe viewer,",
-                     "click-to-craft, and Polymorph enhancements.")
+                     "Set to false to disable synthetic recipes in your recipe viewer",
+                     "and click-to-craft.")
             .define("enabled", true);
         clientBuilder.pop();
         CLIENT_SPEC = clientBuilder.build();

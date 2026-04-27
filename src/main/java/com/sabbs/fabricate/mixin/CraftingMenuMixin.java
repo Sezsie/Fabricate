@@ -18,27 +18,26 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import java.util.Optional;
 
 /**
- * Server-side filter that hides Fabricate synthetics from the crafting
- * output slot for players who have opted out client-side (CLIENT_ENABLED=false).
+ * Server-side filter that demotes Fabricate synthetics from the crafting
+ * output slot whenever any non-synthetic crafting recipe matches the same
+ * grid. The synthetic is still craftable via EMI/JEI click-to-craft (which
+ * dispatches by recipe id and bypasses grid resolution); manual grid layouts
+ * always resolve to the vanilla/datapack recipe when one exists.
  *
- * <p>Without this, the server's shared RecipeManager would happily match a
- * FabricateRecipe for an opted-out player's grid contents and display the
- * synthetic output. From the player's perspective the "disabled" mod would
- * still be actively transforming their crafting attempts.
+ * <p>Without this, the server's RecipeManager returns the first match it
+ * finds in registry order. Synthetics in the {@code fabricate:} namespace
+ * frequently match grids that vanilla shaped recipes also satisfy (a
+ * shapeless N-of-X synthetic can co-match an iron-door pattern, for
+ * example), and the player would see the synthetic's output pop up in the
+ * slot instead of the author-intended vanilla result.
  *
- * <p>We use {@link ModifyVariable} on the {@code Optional<CraftingRecipe>} local
- * rather than a {@link org.spongepowered.asm.mixin.injection.Redirect} on the
- * {@code getRecipeFor} call because Polymorph's {@code MixinCraftingMenu}
- * already owns a @Redirect on that INVOKE and Mixin only permits one redirect
- * per call site. @ModifyVariable fires on the STORE after the call, so it
- * composes with Polymorph's arbitration instead of fighting it: Polymorph
- * picks the "winning" recipe among duplicates, then we veto it if it's a
- * synthetic and the player opted out.
+ * <p>Opted-out players get a stricter rule: any synthetic match is replaced
+ * with {@code Optional.empty()} if no non-synthetic exists, so the slot stays
+ * empty rather than handing them a synthetic they've explicitly disabled.
  *
- * <p>Happy path (opted-in player or a vanilla match on first try) adds one
- * registry lookup + one instanceof check. The fallback
- * rescan only runs when a synthetic was the first match for an opted-out
- * player, which is rare and already off the hot path.
+ * <p>Hot path (vanilla first hit, or empty grid) is one instanceof check.
+ * The full-scan fallback only runs when the first match was a synthetic,
+ * which is rare and already off the per-tick path.
  */
 @Mixin(CraftingMenu.class)
 public abstract class CraftingMenuMixin {
@@ -48,7 +47,7 @@ public abstract class CraftingMenuMixin {
         at = @At("STORE"),
         ordinal = 0
     )
-    private static Optional<CraftingRecipe> fabricate$filterOptOut(
+    private static Optional<CraftingRecipe> fabricate$demoteSynthetics(
             Optional<CraftingRecipe> match,
             AbstractContainerMenu menu,
             Level level,
@@ -57,20 +56,22 @@ public abstract class CraftingMenuMixin {
             ResultContainer resultContainer) {
 
         if (match.isEmpty()) return match;
-        if (!(player instanceof ServerPlayer sp)) return match;
-        if (!OptOutRegistry.isOptedOut(sp.getUUID())) return match;
         if (!(match.get() instanceof FabricateRecipe)) return match;
 
-        // First match was a Fabricate synthetic for an opted-out player. Scan
-        // all crafting recipes for the first non-synthetic that matches.
+        boolean optedOut = (player instanceof ServerPlayer sp)
+            && OptOutRegistry.isOptedOut(sp.getUUID());
+
+        // First match was a synthetic. Scan for a non-synthetic that also
+        // matches and prefer it. If none exists and the player is opted in,
+        // keep the synthetic; if opted out, blank the slot.
         var rm = level.getServer() == null ? null : level.getServer().getRecipeManager();
-        if (rm == null) return Optional.empty();
+        if (rm == null) return optedOut ? Optional.empty() : match;
         for (CraftingRecipe r : rm.getAllRecipesFor(RecipeType.CRAFTING)) {
             if (r instanceof FabricateRecipe) continue;
             if (r.matches(container, level)) {
                 return Optional.of(r);
             }
         }
-        return Optional.empty();
+        return optedOut ? Optional.empty() : match;
     }
 }

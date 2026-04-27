@@ -10,8 +10,10 @@ import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 
 import java.util.HashMap;
-import java.util.IdentityHashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Client-side craftability queries for Fabricate synthetics, based on
@@ -65,12 +67,16 @@ public final class CraftabilityCheck {
      * {@link RefundRegistry}; vanilla uses a closed-form per-ingredient-group
      * min instead of simulating batch-by-batch consumption.
      *
-     * <p>Algorithm: group identical Ingredient references (covers duplicate
-     * slots in shaped recipes via reference equality. The vanilla
-     * {@code NonNullList} reuses Ingredient instances across identical
-     * positions). For each group, {@code demand} is the occurrence count and
-     * {@code supply} is the sum of matching inventory item counts. The result
-     * is {@code min(supply/demand)} across groups.
+     * <p>Algorithm: group ingredients by their accepted-item-set signature
+     * (covers duplicate slots in shaped recipes regardless of whether the
+     * deserializer reuses one Ingredient instance across positions or builds
+     * one per slot. Identity-based grouping miscounts in the latter case: 6
+     * separate plank-Ingredient instances would each report demand=1 with
+     * supply=1 from a single plank in inventory, yielding limit=1 and a
+     * false-positive craftable verdict). For each group, {@code demand} is
+     * the occurrence count and {@code supply} is the sum of matching
+     * inventory item counts. The result is {@code min(supply/demand)} across
+     * groups.
      *
      * <p>Edge case: when two distinct Ingredient references in the same
      * recipe accept overlapping item sets, this over-counts supply because
@@ -91,21 +97,31 @@ public final class CraftabilityCheck {
         Player player = Minecraft.getInstance().player;
         if (player == null) return 0;
 
-        IdentityHashMap<Ingredient, int[]> groups = new IdentityHashMap<>();
+        // Bucket by accepted-item-set, not by Ingredient reference. Some
+        // recipe deserializers produce a fresh Ingredient instance per slot
+        // even when the slots are functionally identical, which made the
+        // old IdentityHashMap version count 6 plank slots as 6 demand=1
+        // groups instead of one demand=6 group. Keep one representative
+        // Ingredient per group so we can still call ing.test for supply
+        // counting.
+        LinkedHashMap<Set<Item>, Ingredient> repByKey = new LinkedHashMap<>();
+        Map<Set<Item>, Integer> demandByKey = new HashMap<>();
         int nonEmpty = 0;
         for (Ingredient ing : recipe.getIngredients()) {
             if (ing.isEmpty()) continue;
             nonEmpty++;
-            groups.computeIfAbsent(ing, k -> new int[1])[0]++;
+            Set<Item> key = ingredientKey(ing);
+            repByKey.putIfAbsent(key, ing);
+            demandByKey.merge(key, 1, Integer::sum);
         }
         if (nonEmpty == 0) return 0;
 
         Inventory inv = player.getInventory();
         int invSize = inv.getContainerSize();
         int max = Integer.MAX_VALUE;
-        for (var entry : groups.entrySet()) {
-            Ingredient ing = entry.getKey();
-            int demand = entry.getValue()[0];
+        for (var entry : repByKey.entrySet()) {
+            Ingredient ing = entry.getValue();
+            int demand = demandByKey.get(entry.getKey());
             int supply = 0;
             for (int s = 0; s < invSize; s++) {
                 ItemStack stack = inv.getItem(s);
@@ -121,6 +137,21 @@ public final class CraftabilityCheck {
     /** Convenience: true when {@link #maxBatches} is {@code >= 1}. */
     public static boolean playerCanCraft(Recipe<?> recipe) {
         return maxBatches(recipe) >= 1;
+    }
+
+    /**
+     * Signature for grouping Ingredients that accept the same item set.
+     * Two distinct {@code Ingredient} instances built from the same tag/list
+     * yield equal sets and bucket together, so a 6-plank stair recipe
+     * produces one demand=6 group regardless of deserializer behavior.
+     */
+    private static Set<Item> ingredientKey(Ingredient ing) {
+        ItemStack[] items = ing.getItems();
+        Set<Item> key = new HashSet<>(items.length * 2);
+        for (ItemStack s : items) {
+            if (!s.isEmpty()) key.add(s.getItem());
+        }
+        return key;
     }
 
     /** One-pass tally of {@code keys}' counts in {@code inv}. O(invSize) instead of O(keys × invSize). */

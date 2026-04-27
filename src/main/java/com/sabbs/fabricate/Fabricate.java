@@ -13,10 +13,14 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 /**
- * Main mod entrypoint. Registers config + networking, then wires integration
- * modules only when their host mod is actually installed  references to EMI
- * or JEI live behind {@code isLoaded} guards so the mod boots cleanly on any
- * combination (EMI alone, JEI alone, both, neither).
+ * Main mod entrypoint. Registers config + networking, then wires the EMI/JEI
+ * integrations.
+ *
+ * <p>JEI is a mandatory client-side dependency (declared in {@code mods.toml}),
+ * so on the client dist it's guaranteed to be loaded. EMI is optional; when
+ * present it takes priority over JEI to avoid running both sidebars at once.
+ * Dedicated servers don't need either: synthetic generation and
+ * {@code CraftPacket} live server-side and don't touch viewer code.
  */
 @Mod(Fabricate.MOD_ID)
 public class Fabricate {
@@ -57,15 +61,21 @@ public class Fabricate {
 
     private static void initClientIntegrations() {
         ModList mods = ModList.get();
-        boolean polymorph = mods.isLoaded("polymorph");
-        boolean emi = mods.isLoaded("emi");
+        // JEI is mandatory in mods.toml so it's always loaded on the client.
+        // The check stays defensive in case Forge ever lets us through with
+        // a missing dep (mismatched dev environment, broken classpath, etc).
         boolean jei = mods.isLoaded("jei");
-        LOGGER.info("[FAB] detected mods: polymorph={}, emi={}, jei={}", polymorph, emi, jei);
+        boolean emi = mods.isLoaded("emi");
+        LOGGER.info("[FAB] detected mods: jei={}, emi={}", jei, emi);
 
-        if (polymorph) com.sabbs.fabricate.integration.polymorph.PolymorphCompat.init();
-        if (emi) com.sabbs.fabricate.integration.emi.EmiCompat.init();
-        // EMI wins when both are present  running both sidebars double-injects
-        // buttons and fires duplicate CraftPackets.
-        if (jei && !emi) com.sabbs.fabricate.integration.jei.JeiCompat.init();
+        if (emi) {
+            // EMI wins when both are present. Running both sidebars
+            // double-injects buttons and fires duplicate CraftPackets.
+            com.sabbs.fabricate.integration.emi.EmiCompat.init();
+        } else if (jei) {
+            com.sabbs.fabricate.integration.jei.JeiCompat.init();
+        } else {
+            LOGGER.error("[FAB] neither JEI nor EMI is loaded - mods.toml dep on JEI was bypassed somehow");
+        }
     }
 }
