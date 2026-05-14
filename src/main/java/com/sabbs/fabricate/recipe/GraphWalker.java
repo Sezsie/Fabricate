@@ -284,10 +284,19 @@ public class GraphWalker {
                 }
                 if (tooMany) continue;
 
+                // Recipe-natural output count. Stair recipes give 4, milk-
+                // bottle-style recipes give 4, etc. Hardcoding 1 here meant
+                // a player consuming 4 bottles + 1 bucket got only 1 bottle
+                // back, AND every recipe that used the multi-output as an
+                // intermediate over-paid because batch counts assumed
+                // producer-yield = 1. Falling back to 1 only when the
+                // recipe somehow reports an empty result.
+                int outputCount = Math.max(1, index.getOutput(recipe).getCount());
+
                 // Generate all valid combinations
                 generateCombinations(allOptions, 0,
                     new LinkedHashMap<>(), new HashMap<>(), 0,
-                    outputItem, minInputCount, maxInputCount, best);
+                    outputItem, outputCount, minInputCount, maxInputCount, best);
             }
         }
 
@@ -347,7 +356,7 @@ public class GraphWalker {
             List<List<SubOption>> allOptions, int idx,
             Map<Item, Integer> currentCost, Map<Item, Integer> currentByproducts,
             int currentTotal,
-            Item outputItem, int minInputCount, int maxInputCount,
+            Item outputItem, int outputCount, int minInputCount, int maxInputCount,
             Map<String, SyntheticRecipe> best) {
 
         // Prune: any extension of this branch only grows currentTotal, so
@@ -363,7 +372,7 @@ public class GraphWalker {
 
             List<ItemStack> refunds = buildRefundList(currentByproducts);
             SyntheticRecipe syn = new SyntheticRecipe(
-                new LinkedHashMap<>(currentCost), new ItemStack(outputItem, 1), refunds
+                new LinkedHashMap<>(currentCost), new ItemStack(outputItem, outputCount), refunds
             );
             String id = syn.generateId();
             best.merge(id, syn, (old, neu) ->
@@ -380,7 +389,7 @@ public class GraphWalker {
 
             generateCombinations(allOptions, idx + 1, currentCost, currentByproducts,
                 currentTotal + option.costTotal,
-                outputItem, minInputCount, maxInputCount, best);
+                outputItem, outputCount, minInputCount, maxInputCount, best);
 
             option.cost.forEach((item, count) -> {
                 int v = currentCost.get(item) - count;

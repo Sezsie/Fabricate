@@ -162,6 +162,18 @@ public class CraftPacket {
      * (item → count); vanilla recipes are consumed by walking their Ingredients
      * and reserving one matching item per Ingredient from the live inventory,
      * rolling back on any failure so partial consumption can't occur.
+     *
+     * <p>Both paths honor the per-item "crafting remainder" rule: items like
+     * {@code water_bucket}, {@code milk_bucket}, {@code honey_bottle}, and
+     * {@code dragon_breath} return their container ({@code bucket},
+     * {@code glass_bottle}) on craft. Vanilla's {@code Recipe.getRemainingItems}
+     * does this slot by slot from a {@code CraftingContainer}; we don't have
+     * one, so we read the per-Item remainder directly off each consumed stack.
+     * Covers ~all real-world cases (Forge's stack-aware
+     * {@code hasCraftingRemainingItem}/{@code getCraftingRemainingItem}). The
+     * narrow exception is recipes that override {@code getRemainingItems} with
+     * NBT-aware logic dependent on the grid layout, which can't be modeled
+     * without a real grid.
      */
     private static boolean consumeMaterials(ServerPlayer player, Recipe<?> recipe, boolean isSynthetic) {
         Inventory inv = player.getInventory();
@@ -179,9 +191,12 @@ public class CraftPacket {
                     return false;
                 }
             }
+            List<ItemStack> remainders = new ArrayList<>();
             for (var entry : required.entrySet()) {
                 removeItem(inv, entry.getKey(), entry.getValue());
+                addRemainderFor(entry.getKey(), entry.getValue(), remainders);
             }
+            giveBack(player, remainders);
             return true;
         }
 
@@ -210,10 +225,54 @@ public class CraftPacket {
                 return false;
             }
         }
+        // Capture remainders BEFORE shrinking - the stack is the source of
+        // truth for hasCraftingRemainingItem (handles NBT-aware items like
+        // potions where the remainder depends on the input stack).
+        List<ItemStack> remainders = new ArrayList<>();
         for (int slot = 0; slot < size; slot++) {
-            if (reserved[slot] > 0) inv.getItem(slot).shrink(reserved[slot]);
+            if (reserved[slot] <= 0) continue;
+            ItemStack stack = inv.getItem(slot);
+            if (stack.hasCraftingRemainingItem()) {
+                ItemStack base = stack.getCraftingRemainingItem();
+                if (!base.isEmpty()) {
+                    // Multiply remainder by the reservation count - one
+                    // empty bucket per water_bucket consumed, etc.
+                    ItemStack r = base.copy();
+                    r.setCount(base.getCount() * reserved[slot]);
+                    remainders.add(r);
+                }
+            }
+            stack.shrink(reserved[slot]);
         }
+        giveBack(player, remainders);
         return true;
+    }
+
+    /**
+     * Looks up the per-Item crafting remainder (if any) and appends
+     * {@code count} copies to {@code out}. Used by the synthetic path where
+     * we consume by item type rather than per-stack, so we can't ask a stack
+     * for its remainder. Falls back to {@code Item.hasCraftingRemainingItem}
+     * which is item-type-level and ignores NBT - synthetics consume base
+     * materials (logs, ingots) that don't have NBT-sensitive remainders
+     * anyway, so this matches the use case.
+     */
+    private static void addRemainderFor(Item item, int count, List<ItemStack> out) {
+        if (item == null || count <= 0) return;
+        if (!item.hasCraftingRemainingItem()) return;
+        Item r = item.getCraftingRemainingItem();
+        if (r == null) return;
+        out.add(new ItemStack(r, count));
+    }
+
+    /** Drops each remainder into the player's inventory, falling back to a world drop. */
+    private static void giveBack(ServerPlayer player, List<ItemStack> remainders) {
+        if (remainders.isEmpty()) return;
+        Inventory inv = player.getInventory();
+        for (ItemStack r : remainders) {
+            if (r.isEmpty()) continue;
+            if (!inv.add(r)) player.drop(r, false);
+        }
     }
 
     private static int countItem(Inventory inv, Item item) {
