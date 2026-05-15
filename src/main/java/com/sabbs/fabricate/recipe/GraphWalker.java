@@ -100,8 +100,21 @@ public class GraphWalker {
             Set<Item> allBaseItems, List<SyntheticRecipe> singleResults,
             RecipeIndex index, int minInputCount, int maxInputCount) {
 
-        // Build production map: item → list of ways to produce it from a single base material
+        // Build production map: item → list of ways to produce it from
+        // fully-reduced base materials. The "fully reduced" invariant is
+        // load-bearing: Option B in the iteration loop copies a producer's
+        // baseCosts verbatim into the substituted synthetic's cost vector,
+        // so a producer carrying an intermediate (shaft, book, paper) would
+        // propagate that intermediate forward forever. Only producers whose
+        // baseCosts contain exclusively non-producible items extend the
+        // chain deeper.
         Map<Item, List<SyntheticRecipe>> productionMap = new HashMap<>();
+
+        // Items producible by some vanilla recipe. Anything not in this set
+        // is a true base material (raw drop, mob drop, world-gen, smelting
+        // result, etc.). Computed once, used both for the initial productionMap
+        // filter and the per-iteration fold-back filter.
+        final Set<Item> producibleItems = new HashSet<>(index.getAllOutputItems());
 
         // Source 1: walkSingle results (e.g., oak_log → sticks through planks)
         for (SyntheticRecipe syn : singleResults) {
@@ -111,7 +124,19 @@ public class GraphWalker {
         // Source 2: vanilla single-input-type recipes (e.g., iron_block → 9 iron_ingots)
         addVanillaProducers(productionMap, allBaseItems, index);
 
-        // Deduplicate: keep cheapest producer per (output item, base item) pair
+        // Dedup initial productionMap to the cheapest single-base producer
+        // per (output, base) pair. We intentionally DO NOT filter out
+        // single-base producers whose base is itself a recipe output:
+        // metals (iron_ingot, gold_ingot, copper_ingot) are recipe outputs
+        // via block↔ingot↔nugget conversions but the player obtains them
+        // primarily via smelting, which lives outside RecipeType.CRAFTING
+        // and so is invisible to us. Dropping {iron_block:1}->9 iron_ingot
+        // here would prevent iron_sword from substituting iron_ingot with
+        // iron_block, which is the substitution Fabricate is meant to
+        // enable. The fold-back step below handles the "no intermediates
+        // propagating forward" invariant where it actually matters (in the
+        // synthetics phase 2 generates), without breaking the smelting
+        // substitution path.
         for (var mapEntry : productionMap.entrySet()) {
             Map<Item, SyntheticRecipe> bestPerBase = new LinkedHashMap<>();
             for (SyntheticRecipe syn : mapEntry.getValue()) {
@@ -128,9 +153,9 @@ public class GraphWalker {
         int recipesWithMultiIng = 0;
 
         // Pre-compute the set of items that actually appear as an ingredient
-        // in some recipe. Folding multi-base synthetics whose output is never
-        // used as an ingredient (terminal outputs like comparator itself) is
-        // wasted work and only inflates productionMap.
+        // in some recipe. Folding synthetics whose output is never used as an
+        // ingredient (terminal outputs like comparator itself) is wasted work
+        // and only inflates productionMap.
         Set<Item> usedAsIngredient = new HashSet<>();
         for (Item out : index.getAllOutputItems()) {
             for (Recipe<?> r : index.getRecipesProducing(out)) {
@@ -150,13 +175,21 @@ public class GraphWalker {
         // stick+redstone, etc.) and chains of those (a recipe needing
         // comparator as ingredient, etc.).
         //
-        // Safety: MAX_PRODUCERS_PER_ITEM is a GLOBAL cap on productionMap
-        // entries per item, applied after every fold. This bounds per-slot
-        // option count regardless of iteration depth, so iteration count
-        // costs linear extra work (one more outer-loop pass), not
-        // exponential blow-up.
+        // MAX_PRODUCERS_PER_ITEM is the memory backstop. Without it, every
+        // iteration's fold-back accumulates more fully-reduced producers per
+        // item (one per distinct base-material combination - typically one
+        // per log type, dye color, ingot variant), and the producer count
+        // compounds geometrically across iterations. Iter 3 of a heavy
+        // modpack would balloon best.size() from 80k to 700k to 3M+ and OOM
+        // the JVM during Option B's per-producer SubOption allocation.
+        //
+        // Cap of 10 is generous enough to cover typical tag diversity
+        // (vanilla has 9 plank/log types, mods rarely exceed). The trim
+        // sorts by (intermediateCount, totalInputCount) so fully-reduced
+        // producers always win - the cap doesn't break correctness like
+        // the original cap=3 did, it just bounds the working set.
         final int MAX_ITERATIONS = 5;
-        final int MAX_PRODUCERS_PER_ITEM = 3;
+        final int MAX_PRODUCERS_PER_ITEM = 10;
         int prevBestSize = -1;
         int iteration = 0;
 
@@ -300,12 +333,24 @@ public class GraphWalker {
             }
         }
 
-            // Fold this iteration's results into productionMap so the next
-            // pass can substitute them, but only for outputs that are
-            // actually used as ingredients elsewhere. Then trim each
-            // affected item's full producer list to MAX_PRODUCERS_PER_ITEM
-            // cheapest globally. This is what makes raising MAX_ITERATIONS
-            // safe: per-slot option count stays bounded across all passes.
+            // Fold this iteration's multi-base synthetics into productionMap
+            // so the next pass can substitute them. ONE filter applies:
+            // output must appear as an ingredient somewhere (no point
+            // folding terminal outputs like comparator).
+            //
+            // We deliberately do NOT filter on intermediateCount here.
+            // Items like leather (4 rabbit_hide -> 1 leather), iron_ingot
+            // (block <-> ingot <-> nugget), and other circular-subgraph
+            // members are technically "producible by crafting" but the
+            // player obtains them primarily via non-crafting sources
+            // (mob drops, smelting). Filtering them out would prevent
+            // writable_book from substituting book = {leather, sugar_cane},
+            // iron_sword from substituting iron_ingot = {iron_block}, etc.
+            // The trim's (intermediateCount, totalInputCount) sort already
+            // gives fully-reduced producers priority - intermediate ones
+            // only survive when fully-reduced producers don't fill the
+            // MAX_PRODUCERS_PER_ITEM slots.
+            int folded = 0;
             Set<Item> touchedOutputs = new HashSet<>();
             for (SyntheticRecipe syn : best.values()) {
                 Item out = syn.output().getItem();
@@ -313,25 +358,39 @@ public class GraphWalker {
                 Set<String> ids = producerIds.computeIfAbsent(out, k -> new HashSet<>());
                 if (ids.add(syn.generateId())) {
                     productionMap.computeIfAbsent(out, k -> new ArrayList<>()).add(syn);
+                    folded++;
+                    touchedOutputs.add(out);
                 }
-                touchedOutputs.add(out);
             }
+
+            // Trim down to MAX_PRODUCERS_PER_ITEM per output. Sort prefers
+            // fully-reduced producers (intermediateCount == 0) - critical
+            // for the chain to extend - then cheapest by input count.
+            // Memory backstop: without this, productionMap grows
+            // unboundedly and iter 3+ blows up the heap.
+            //
+            // Note: we do NOT clear and re-build producerIds after trim.
+            // Dropped synthetics keep their ids in the set so the next
+            // iteration's fold doesn't re-add them. Without this, every
+            // iteration's fold would re-fold the previous iteration's
+            // dropped synthetics (since their ids were cleared from the
+            // set), trim would drop them again, and the cycle would burn
+            // CPU producing identical work each pass. Producer pools
+            // stabilize after the first trim instead of oscillating.
+            Comparator<SyntheticRecipe> trimOrder =
+                Comparator.comparingInt((SyntheticRecipe s) -> intermediateCount(s, producibleItems))
+                          .thenComparingInt(SyntheticRecipe::totalInputCount);
             int trimmed = 0;
             for (Item out : touchedOutputs) {
                 List<SyntheticRecipe> producers = productionMap.get(out);
                 if (producers == null || producers.size() <= MAX_PRODUCERS_PER_ITEM) continue;
-                producers.sort(Comparator.comparingInt(SyntheticRecipe::totalInputCount));
+                producers.sort(trimOrder);
                 int over = producers.size() - MAX_PRODUCERS_PER_ITEM;
                 producers.subList(MAX_PRODUCERS_PER_ITEM, producers.size()).clear();
-                // Resync id-set with the trimmed list so future passes
-                // don't see ghost ids for entries we just dropped.
-                Set<String> ids = producerIds.computeIfAbsent(out, k -> new HashSet<>());
-                ids.clear();
-                for (SyntheticRecipe s : producers) ids.add(s.generateId());
                 trimmed += over;
             }
-            Fabricate.LOGGER.info("[FAB-gen] phase 2 iteration {}: {} multi-material synthetics (delta={}, trimmed={})",
-                iteration, best.size(), best.size() - prevBestSize, trimmed);
+            Fabricate.LOGGER.info("[FAB-gen] phase 2 iteration {}: {} multi-material synthetics (delta={}, folded={}, trimmed={})",
+                iteration, best.size(), best.size() - prevBestSize, folded, trimmed);
         }
 
         Fabricate.LOGGER.info("Fabricate Multi: examined {} recipes, {} had 2+ ingredient types, generated {} multi-material recipes ({} iterations)",
@@ -496,5 +555,19 @@ public class GraphWalker {
 
     private static int ceilDiv(int a, int b) {
         return (a + b - 1) / b;
+    }
+
+    /**
+     * Number of distinct items in {@code syn.baseCosts()} that are
+     * themselves outputs of some recipe (i.e., not raw base materials).
+     * Used by the fold-back trim to prefer fully-reduced producers, so the
+     * iterative substitution chain can reach base materials at depth 3+.
+     */
+    private static int intermediateCount(SyntheticRecipe syn, Set<Item> producibleItems) {
+        int n = 0;
+        for (Item i : syn.baseCosts().keySet()) {
+            if (producibleItems.contains(i)) n++;
+        }
+        return n;
     }
 }

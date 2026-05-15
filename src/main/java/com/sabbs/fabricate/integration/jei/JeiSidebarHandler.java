@@ -64,7 +64,19 @@ public final class JeiSidebarHandler {
 
     /** Items currently hidden from JEI while craftables mode is on. */
     private static final List<ItemStack> HIDDEN = new ArrayList<>();
+    /** Item identities that are currently hidden (parallel to HIDDEN, for O(1) checks). */
+    private static Set<Item> currentlyHiddenItems = new HashSet<>();
     private static boolean craftablesActive = false;
+
+    /**
+     * Cached {@code item -> all ItemStack instances JEI knows for that item}.
+     * Rebuilt lazily when the {@link IIngredientManager} reference changes.
+     * Iterating {@code getAllIngredients()} on every refresh costs tens of
+     * ms on heavy modpacks (30k+ stacks); we only need to enumerate once
+     * per ingredient-manager identity.
+     */
+    private static Map<Item, List<ItemStack>> itemToStacks = null;
+    private static Object itemToStacksSource = null;
 
     /** Prevents per-tick thrashing if the ingredient manager isn't ready yet. */
     private static int evalCooldown = 0;
@@ -207,9 +219,13 @@ public final class JeiSidebarHandler {
             return;
         }
 
-        // Poll at most ~2x per second; skip entirely if materials haven't changed.
+        // Poll at most ~1x per second; skip entirely if materials haven't
+        // changed. 20 ticks is the sweet spot: fast enough that a pickup
+        // updates the craftables filter within ~1s, slow enough that
+        // shift-clicking through a chest doesn't trigger a refresh on every
+        // intermediate inventory state.
         if (evalCooldown-- > 0) return;
-        evalCooldown = 10;
+        evalCooldown = 20;
 
         // countMaterials walks the full inventory + cursor + open slots; do it
         // once and feed the same map into both the change-detection hash and
@@ -221,35 +237,137 @@ public final class JeiSidebarHandler {
 
         Set<Item> craftable = computeCraftableItems(mc, materials);
         if (craftable.equals(lastCraftableSet)) return;
+        Set<Item> previousCraftable = lastCraftableSet;
         lastCraftableSet = craftable;
 
-        if (craftablesActive) restoreHidden(rt);
-        applyCraftables(rt, craftable);
+        // First activation: hide everything that isn't craftable. Subsequent
+        // refreshes: only send JEI the delta (items whose craftability
+        // actually flipped). This is the big perf win - on a heavy modpack
+        // a typical inventory pickup flips 0-5 items, not all 30k.
+        if (craftablesActive) {
+            applyDelta(rt, previousCraftable, craftable);
+        } else {
+            applyInitial(rt, craftable);
+        }
     }
 
-    private static void applyCraftables(IJeiRuntime rt, Set<Item> craftable) {
-        if (craftable.isEmpty()) return;
+    /**
+     * First-time activation of craftables filter. Has to iterate all of
+     * JEI's ingredients to compute the initial hide set, so it's the
+     * expensive call - but it only runs once per crafting screen open.
+     */
+    private static void applyInitial(IJeiRuntime rt, Set<Item> craftable) {
+        Map<Item, List<ItemStack>> idx = ensureItemToStacks(rt);
+        if (idx.isEmpty()) return;
 
-        IIngredientManager im = rt.getIngredientManager();
         List<ItemStack> toHide = new ArrayList<>();
-        try {
-            for (ItemStack stack : im.getAllIngredients(VanillaTypes.ITEM_STACK)) {
-                if (!craftable.contains(stack.getItem())) toHide.add(stack);
-            }
-        } catch (Throwable t) {
-            Fabricate.LOGGER.debug("[FAB-JEI] failed to enumerate ingredients", t);
+        Set<Item> hiddenItems = new HashSet<>();
+        for (var entry : idx.entrySet()) {
+            Item item = entry.getKey();
+            if (craftable.contains(item)) continue;
+            toHide.addAll(entry.getValue());
+            hiddenItems.add(item);
+        }
+        if (toHide.isEmpty()) {
+            craftablesActive = true; // empty filter is still "active"
             return;
         }
-        if (toHide.isEmpty()) return;
 
         try {
-            im.removeIngredientsAtRuntime(VanillaTypes.ITEM_STACK, toHide);
+            rt.getIngredientManager().removeIngredientsAtRuntime(VanillaTypes.ITEM_STACK, toHide);
             HIDDEN.clear();
             HIDDEN.addAll(toHide);
+            currentlyHiddenItems = hiddenItems;
             craftablesActive = true;
         } catch (Throwable t) {
-            Fabricate.LOGGER.warn("[FAB-JEI] removeIngredientsAtRuntime failed", t);
+            Fabricate.LOGGER.warn("[FAB-JEI] removeIngredientsAtRuntime (initial) failed", t);
         }
+    }
+
+    /**
+     * Send JEI only the items whose craftability flipped since the last
+     * refresh:
+     * <ul>
+     *   <li>newly craftable items (in new, not in old) get added back via
+     *       {@code addIngredientsAtRuntime} - they were hidden, restore them.</li>
+     *   <li>newly uncraftable items (in old, not in new) get removed via
+     *       {@code removeIngredientsAtRuntime} - they were visible, hide them.</li>
+     * </ul>
+     * Both calls are batched. JEI's filter/search index rebuild cost scales
+     * with the size of the delta, not the total ingredient count, so on
+     * typical inventory shuffles this is near-instant.
+     */
+    private static void applyDelta(IJeiRuntime rt, Set<Item> oldCraftable, Set<Item> newCraftable) {
+        Map<Item, List<ItemStack>> idx = ensureItemToStacks(rt);
+        if (idx.isEmpty()) return;
+
+        // Items that became craftable: were hidden, now show.
+        List<ItemStack> toShow = new ArrayList<>();
+        Set<Item> showItems = new HashSet<>();
+        for (Item i : newCraftable) {
+            if (oldCraftable.contains(i)) continue;
+            if (!currentlyHiddenItems.contains(i)) continue;
+            List<ItemStack> stacks = idx.get(i);
+            if (stacks == null || stacks.isEmpty()) continue;
+            toShow.addAll(stacks);
+            showItems.add(i);
+        }
+
+        // Items that became uncraftable: were visible, now hide.
+        List<ItemStack> toHide = new ArrayList<>();
+        Set<Item> hideItems = new HashSet<>();
+        for (Item i : oldCraftable) {
+            if (newCraftable.contains(i)) continue;
+            if (currentlyHiddenItems.contains(i)) continue;
+            List<ItemStack> stacks = idx.get(i);
+            if (stacks == null || stacks.isEmpty()) continue;
+            toHide.addAll(stacks);
+            hideItems.add(i);
+        }
+
+        IIngredientManager im = rt.getIngredientManager();
+        if (!toShow.isEmpty()) {
+            try {
+                im.addIngredientsAtRuntime(VanillaTypes.ITEM_STACK, toShow);
+                currentlyHiddenItems.removeAll(showItems);
+                HIDDEN.removeIf(s -> showItems.contains(s.getItem()));
+            } catch (Throwable t) {
+                Fabricate.LOGGER.debug("[FAB-JEI] addIngredientsAtRuntime (delta) failed", t);
+            }
+        }
+        if (!toHide.isEmpty()) {
+            try {
+                im.removeIngredientsAtRuntime(VanillaTypes.ITEM_STACK, toHide);
+                currentlyHiddenItems.addAll(hideItems);
+                HIDDEN.addAll(toHide);
+            } catch (Throwable t) {
+                Fabricate.LOGGER.debug("[FAB-JEI] removeIngredientsAtRuntime (delta) failed", t);
+            }
+        }
+    }
+
+    /**
+     * Builds (or returns the cached) item-to-stacks index. Identity-keyed
+     * on the {@link IIngredientManager} so a JEI runtime swap (rare, but
+     * happens on /reload) invalidates correctly.
+     */
+    private static Map<Item, List<ItemStack>> ensureItemToStacks(IJeiRuntime rt) {
+        IIngredientManager im = rt.getIngredientManager();
+        if (itemToStacks != null && itemToStacksSource == im) return itemToStacks;
+        Map<Item, List<ItemStack>> map = new HashMap<>();
+        try {
+            for (ItemStack stack : im.getAllIngredients(VanillaTypes.ITEM_STACK)) {
+                if (stack.isEmpty()) continue;
+                map.computeIfAbsent(stack.getItem(), k -> new ArrayList<>()).add(stack);
+            }
+        } catch (Throwable t) {
+            Fabricate.LOGGER.debug("[FAB-JEI] enumerate-ingredients failed", t);
+            return Collections.emptyMap();
+        }
+        itemToStacks = map;
+        itemToStacksSource = im;
+        Fabricate.LOGGER.info("[FAB-JEI] built itemToStacks index ({} items)", map.size());
+        return map;
     }
 
     private static void disableCraftables() {
@@ -261,6 +379,7 @@ public final class JeiSidebarHandler {
         IJeiRuntime rt = FabricateJeiPlugin.getRuntime();
         if (rt != null) restoreHidden(rt);
         HIDDEN.clear();
+        currentlyHiddenItems.clear();
         craftablesActive = false;
         lastMaterialsHash = Long.MIN_VALUE;
         lastCraftableSet = Collections.emptySet();
@@ -274,6 +393,7 @@ public final class JeiSidebarHandler {
             Fabricate.LOGGER.debug("[FAB-JEI] addIngredientsAtRuntime failed on restore", t);
         }
         HIDDEN.clear();
+        currentlyHiddenItems.clear();
         craftablesActive = false;
     }
 
