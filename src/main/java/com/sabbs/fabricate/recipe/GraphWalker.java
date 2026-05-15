@@ -1,6 +1,7 @@
 package com.sabbs.fabricate.recipe;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -183,11 +184,12 @@ public class GraphWalker {
         // modpack would balloon best.size() from 80k to 700k to 3M+ and OOM
         // the JVM during Option B's per-producer SubOption allocation.
         //
-        // Cap of 10 is generous enough to cover typical tag diversity
-        // (vanilla has 9 plank/log types, mods rarely exceed). The trim
-        // sorts by (intermediateCount, totalInputCount) so fully-reduced
-        // producers always win - the cap doesn't break correctness like
-        // the original cap=3 did, it just bounds the working set.
+        // Cap of 10 producers per item. The slot-ordering in phase 2
+        // (high-variety slot outer) ensures the top 10 already covers
+        // both primary axes (e.g., 5 wood types × 2 dust forms for
+        // torch) so cap=10 isn't a correctness bottleneck. Higher caps
+        // compounded combinatorial explosion across iterations without
+        // proportionate correctness gain.
         final int MAX_ITERATIONS = 5;
         final int MAX_PRODUCERS_PER_ITEM = 10;
         int prevBestSize = -1;
@@ -274,8 +276,24 @@ public class GraphWalker {
                         bestProducers.addAll(productionMap.getOrDefault(searchItem, List.of()));
                     }
 
+                    // Sort producers by:
+                    //   1. totalInputCount (cheapest first - already had this),
+                    //   2. shortest first-base-item path (oak_log = 7 chars
+                    //      beats stripped_dark_oak_log = 20 - canonical
+                    //      vanilla items players actually have in their
+                    //      inventory get preferred positions),
+                    //   3. generateId() alphabetical (deterministic
+                    //      tiebreaker so the same trim survivors come out
+                    //      across mod reloads, regardless of HashMap
+                    //      iteration order on baseItemSet).
+                    // This decides which producers survive the trim's
+                    // stable sort downstream when the (intermediateCount,
+                    // totalInputCount) primary criterion ties.
                     bestProducers.stream()
-                        .sorted(Comparator.comparingInt(SyntheticRecipe::totalInputCount))
+                        .sorted(Comparator
+                            .comparingInt(SyntheticRecipe::totalInputCount)
+                            .thenComparingInt(GraphWalker::firstBasePathLength)
+                            .thenComparing(SyntheticRecipe::generateId))
                         .forEach(producer -> {
                             int synOutputCount = producer.output().getCount();
                             int batches = ceilDiv(qty, synOutputCount);
@@ -305,6 +323,16 @@ public class GraphWalker {
                 // 9-base-material cap in generateCombinations so the source
                 // ceiling and the synthetic ceiling agree.
                 if (ingItems.size() > 9) continue;
+                // Sort slot options by size descending so the high-variety
+                // slot becomes the OUTER loop in generateCombinations.
+                // Without this, low-variety slots like {raw, block} dust
+                // group all their variant insertions together in `best`,
+                // which causes the trim's "first-N by insertion" cut to
+                // drop one entire variant axis (e.g., all torch+block
+                // producers cut while torch+raw all survive). With the
+                // high-variety slot outer, insertions alternate variants
+                // per outer option, so both axes survive the trim.
+                allOptions.sort(Comparator.comparingInt((List<SubOption> opts) -> opts.size()).reversed());
                 // Guard against combinatorial explosion from tag-expanded
                 // options. Bumped from 50k to 200k to give 6-9-ingredient
                 // recipes room to fully enumerate (worst realistic case
@@ -395,7 +423,147 @@ public class GraphWalker {
 
         Fabricate.LOGGER.info("Fabricate Multi: examined {} recipes, {} had 2+ ingredient types, generated {} multi-material recipes ({} iterations)",
             recipesExamined, recipesWithMultiIng, best.size(), iteration);
-        return new ArrayList<>(best.values());
+
+        // Stage 2: compaction. Phase 2 does per-slot substitution that
+        // can't share intermediate waste across batches: comparator's 3
+        // torches each substitute the {stick, redstone_block} producer
+        // independently, so the synthetic asks for 3 blocks even though
+        // 1 block (= 9 dust) covers all 3 torches' dust demand. The fix
+        // is to re-resolve each synthetic from its own baseCosts as
+        // baseItems via CostResolver, which DOES share byproducts across
+        // siblings during recursion. The new baseCost is at-or-below the
+        // original's totalInputCount; when strictly below, we swap in
+        // the compacted version. Walk-single synthetics (baseCosts size
+        // 1) are skipped because CostResolver already built them
+        // optimally.
+        //
+        // Memoized by (outputItem, sorted baseCosts.keySet()): all
+        // synthetics with the same output and same set of input items
+        // resolve to the same CostResolver answer regardless of their
+        // pre-compaction counts. With this cache, vanilla dev env runs
+        // a few thousand CostResolver calls instead of hundreds of
+        // thousands.
+        Map<String, CostResolver.ResolutionResult> compactCache = new HashMap<>();
+        Set<String> compactCacheMiss = new HashSet<>();
+        int compactedCount = 0;
+        Map<String, SyntheticRecipe> compactedBest = new LinkedHashMap<>();
+        long compactStart = System.currentTimeMillis();
+        for (SyntheticRecipe syn : best.values()) {
+            SyntheticRecipe replacement = compact(syn, index, compactCache, compactCacheMiss);
+            if (replacement != syn) compactedCount++;
+            compactedBest.merge(replacement.generateId(), replacement, (old, neu) ->
+                neu.totalInputCount() < old.totalInputCount() ? neu : old);
+        }
+        Fabricate.LOGGER.info("[FAB-gen] phase 2 compaction: {} of {} synthetics shrunk (final count: {}, {} cached groups, {}ms)",
+            compactedCount, best.size(), compactedBest.size(),
+            compactCache.size() + compactCacheMiss.size(),
+            System.currentTimeMillis() - compactStart);
+
+        return new ArrayList<>(compactedBest.values());
+    }
+
+    /**
+     * Re-resolves a phase-2 synthetic from its own baseCosts items as
+     * baseItems, using CostResolver's byproduct-sharing recursion. If the
+     * result has fewer total inputs than the original, returns a new
+     * SyntheticRecipe with the compacted cost and refund list; otherwise
+     * returns the original unchanged.
+     *
+     * <p>Filters out unprofitable calls cheaply before invoking
+     * CostResolver: skips single-base synthetics (CostResolver already
+     * built them optimally) and skips synthetics whose refund items don't
+     * overlap with any cost item's recipe ingredients (no batch-sharing
+     * opportunity).
+     */
+    private static SyntheticRecipe compact(SyntheticRecipe syn, RecipeIndex index,
+                                           Map<String, CostResolver.ResolutionResult> cache,
+                                           Set<String> negativeCache) {
+        // Walk-single synthetics are already optimal; compaction can only
+        // match, not improve. Skip.
+        if (syn.baseCosts().size() < 2) return syn;
+
+        // Cache key: outputItem + sorted item paths of baseCosts.keySet.
+        // Synthetics that share this key resolve to the same CostResolver
+        // answer regardless of their pre-compaction quantity counts.
+        Item outputItem = syn.output().getItem();
+        var outKey = ForgeRegistries.ITEMS.getKey(outputItem);
+        if (outKey == null) return syn;
+        Set<Item> costItems = syn.baseCosts().keySet();
+        List<String> sortedPaths = new ArrayList<>(costItems.size());
+        for (Item it : costItems) {
+            var k = ForgeRegistries.ITEMS.getKey(it);
+            if (k == null) return syn;
+            sortedPaths.add(k.toString());
+        }
+        Collections.sort(sortedPaths);
+        String cacheKey = outKey + "|" + String.join(",", sortedPaths);
+
+        CostResolver.ResolutionResult result;
+        if (cache.containsKey(cacheKey)) {
+            result = cache.get(cacheKey);
+        } else if (negativeCache.contains(cacheKey)) {
+            return syn;
+        } else {
+            // Without refunds there's no waste to recover via batch sharing.
+            // Apply this filter only on first encounter for this cache key -
+            // a later synthetic with the same (output, keySet) may have
+            // refunds even if this one doesn't, so the cache key result
+            // applies regardless of per-synthetic refund presence.
+            if (syn.refundItems().isEmpty()) {
+                // Skip without caching; another syn with same key + refunds
+                // may still trigger compaction.
+                return syn;
+            }
+            // Opportunity check: is any refund item produced by a recipe
+            // whose ingredients include a cost item?
+            boolean opportunity = false;
+            outer:
+            for (ItemStack refund : syn.refundItems()) {
+                Item refundItem = refund.getItem();
+                for (Recipe<?> r : index.getRecipesProducing(refundItem)) {
+                    for (Ingredient ing : r.getIngredients()) {
+                        if (ing.isEmpty()) continue;
+                        for (ItemStack s : ing.getItems()) {
+                            if (costItems.contains(s.getItem())) {
+                                opportunity = true;
+                                break outer;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!opportunity) {
+                negativeCache.add(cacheKey);
+                return syn;
+            }
+
+            // Re-resolve via CostResolver with the synthetic's baseCosts
+            // items as the base material set. Fresh inner cache because
+            // baseItems varies per cache-key call.
+            result = CostResolver.resolveWithByproducts(
+                outputItem,
+                syn.output().getCount(),
+                costItems,
+                index,
+                12,
+                new HashSet<>(),
+                new HashMap<>()
+            );
+            cache.put(cacheKey, result);
+        }
+
+        if (result == null) return syn;
+
+        int newTotal = 0;
+        for (int v : result.baseCost().values()) newTotal += v;
+        if (newTotal >= syn.totalInputCount()) return syn;
+
+        List<ItemStack> newRefunds = buildRefundList(result.byproducts());
+        return new SyntheticRecipe(
+            new LinkedHashMap<>(result.baseCost()),
+            syn.output().copy(),
+            newRefunds
+        );
     }
 
     /**
@@ -555,6 +723,20 @@ public class GraphWalker {
 
     private static int ceilDiv(int a, int b) {
         return (a + b - 1) / b;
+    }
+
+    /**
+     * Length of the first {@code baseCosts} item's registry path. Used as
+     * a deterministic tiebreaker that prefers canonical short-named items
+     * (e.g. {@code oak_log} over {@code stripped_dark_oak_log}) when many
+     * producers tie on totalInputCount, so the trim's stable-sort
+     * survival selection deterministically keeps player-familiar variants.
+     */
+    private static int firstBasePathLength(SyntheticRecipe s) {
+        var it = s.baseCosts().keySet().iterator();
+        if (!it.hasNext()) return Integer.MAX_VALUE;
+        var key = ForgeRegistries.ITEMS.getKey(it.next());
+        return key == null ? Integer.MAX_VALUE : key.getPath().length();
     }
 
     /**

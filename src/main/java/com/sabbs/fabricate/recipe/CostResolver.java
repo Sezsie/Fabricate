@@ -35,9 +35,6 @@ public class CostResolver {
         if (depthLimit <= 0 || visited.contains(target)) {
             return null;
         }
-
-        // Cached results are already isolated (see cache.put below) and
-        // callers only forEach the inner maps  no defensive copy needed.
         if (cache != null && quantity == 1 && cache.containsKey(target)) {
             return cache.get(target);
         }
@@ -58,7 +55,38 @@ public class CostResolver {
             Map<Item, Integer> totalByproducts = new HashMap<>();
             boolean allResolved = true;
 
-            for (var entry : flatCost.entrySet()) {
+            // Resolve flatCost entries in dependency order: items whose
+            // recipes produce other flatCost items as transitive byproducts
+            // resolve first, so the byproduct waste is available when the
+            // dependent items take their turn. Without this, HashMap
+            // iteration order decides, and the wooden_shovel case
+            // (1 plank + 2 sticks) gives a non-deterministic 1-log or
+            // 2-log cost depending on which log variant's hash lands the
+            // plank slot first in iteration. Stick's recipe (2 planks ->
+            // 4 sticks) produces plank waste when resolved, so resolving
+            // stick first lets the plank slot reuse that waste.
+            List<Map.Entry<Item, Integer>> orderedEntries = new ArrayList<>(flatCost.entrySet());
+            if (orderedEntries.size() > 1) {
+                Map<Item, Integer> outDegree = new HashMap<>();
+                for (Item x : flatCost.keySet()) {
+                    int n = 0;
+                    for (Recipe<?> r : index.getRecipesProducing(x)) {
+                        for (Ingredient ing : r.getIngredients()) {
+                            if (ing.isEmpty()) continue;
+                            for (ItemStack s : ing.getItems()) {
+                                Item dep = s.getItem();
+                                if (dep != x && flatCost.containsKey(dep)) n++;
+                            }
+                        }
+                    }
+                    outDegree.put(x, n);
+                }
+                orderedEntries.sort((a, b) -> Integer.compare(
+                    outDegree.getOrDefault(b.getKey(), 0),
+                    outDegree.getOrDefault(a.getKey(), 0)));
+            }
+
+            for (var entry : orderedEntries) {
                 Item needed = entry.getKey();
                 int neededQty = entry.getValue();
 

@@ -16,11 +16,14 @@ import org.apache.logging.log4j.Logger;
  * Main mod entrypoint. Registers config + networking, then wires the EMI/JEI
  * integrations.
  *
- * <p>JEI is a mandatory client-side dependency (declared in {@code mods.toml}),
- * so on the client dist it's guaranteed to be loaded. EMI is optional; when
- * present it takes priority over JEI to avoid running both sidebars at once.
- * Dedicated servers don't need either: synthetic generation and
- * {@code CraftPacket} live server-side and don't touch viewer code.
+ * <p>EMI and JEI are both listed as optional in {@code mods.toml} because
+ * Forge has no native "either A or B" dependency form. The actual requirement
+ * (at least one of EMI or JEI on the client) is enforced at construction
+ * time below, where a missing-both situation throws a clear error rather
+ * than letting the mod load into a non-functional state. When both are
+ * present EMI takes priority. Dedicated servers don't need either:
+ * synthetic generation and {@code CraftPacket} live server-side and don't
+ * touch viewer code.
  */
 @Mod(Fabricate.MOD_ID)
 public class Fabricate {
@@ -61,21 +64,26 @@ public class Fabricate {
 
     private static void initClientIntegrations() {
         ModList mods = ModList.get();
-        // JEI is mandatory in mods.toml so it's always loaded on the client.
-        // The check stays defensive in case Forge ever lets us through with
-        // a missing dep (mismatched dev environment, broken classpath, etc).
         boolean jei = mods.isLoaded("jei");
         boolean emi = mods.isLoaded("emi");
         LOGGER.info("[FAB] detected mods: jei={}, emi={}", jei, emi);
+
+        // Hard requirement: a recipe viewer is the only way users interact
+        // with synthetics on the client. Without EMI or JEI there's no
+        // sidebar button, no click-to-craft, nothing the player can see.
+        // Fail fast with a readable message instead of loading silently.
+        if (!emi && !jei) {
+            throw new RuntimeException(
+                "Fabricate requires either EMI or JEI to be installed on the client. "
+                + "Install one of them (or both) and relaunch.");
+        }
 
         if (emi) {
             // EMI wins when both are present. Running both sidebars
             // double-injects buttons and fires duplicate CraftPackets.
             com.sabbs.fabricate.integration.emi.EmiCompat.init();
-        } else if (jei) {
-            com.sabbs.fabricate.integration.jei.JeiCompat.init();
         } else {
-            LOGGER.error("[FAB] neither JEI nor EMI is loaded - mods.toml dep on JEI was bypassed somehow");
+            com.sabbs.fabricate.integration.jei.JeiCompat.init();
         }
     }
 }

@@ -22,13 +22,17 @@ description='''Craft your items using base materials!'''
     ordering="NONE"
     side="BOTH"
 
-# JEI is required on the client - it's the baseline recipe viewer Fabricate
-# integrates with. EMI is optional; when present it takes priority over JEI
-# (its recipe-reload hook is skipped on JEMI setups to avoid duplicate-id
-# errors - see EmiCompat#reloadRecipes). Dedicated servers need neither.
+# Recipe viewers. At least one of EMI or JEI must be installed on the client;
+# Fabricate.initClientIntegrations enforces this at construction time and
+# refuses to load with a clear error when neither is present. Forge's TOML
+# format has no "OR" between deps, so both are listed as mandatory=false
+# here and the requirement is enforced in code. When both are present EMI
+# wins (its recipe-reload hook is skipped on JEMI setups to avoid
+# duplicate-id errors - see EmiCompat#reloadRecipes). Dedicated servers
+# need neither.
 [[dependencies.fabricate]]
     modId="jei"
-    mandatory=true
+    mandatory=false
     versionRange="[15,)"
     ordering="AFTER"
     side="CLIENT"

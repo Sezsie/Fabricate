@@ -79,10 +79,12 @@ dependencies {
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 
     // Recipe viewers compileOnly for API access, runtimeOnly for dev testing.
+    // QA-RUN: toggle the runtimeOnly lines below to swap which viewers load.
+    // Currently: EMI only.
     compileOnly fg.deobf('curse.maven:emi-580555:6420945')
     compileOnly fg.deobf('curse.maven:jei-238222:7391695')
     runtimeOnly fg.deobf('curse.maven:emi-580555:6420945')
-    runtimeOnly fg.deobf('curse.maven:jei-238222:7391695')
+    // runtimeOnly fg.deobf('curse.maven:jei-238222:7391695')
 
     // Configured in-game config UI, dev-only. No API usage on our side.
     // 5180900 = Configured 2.2.3 for 1.20.1 Forge.
