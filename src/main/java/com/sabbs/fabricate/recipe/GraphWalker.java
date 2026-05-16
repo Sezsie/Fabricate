@@ -243,13 +243,82 @@ public class GraphWalker {
             final int hardCap = com.sabbs.fabricate.ModConfig.MAX_SYNTHETIC_COUNT.get();
             boolean hitHardCap = false;
 
+            // Iteration order. Iteration 1 has no `best` to prioritize from,
+            // so it processes outputs in the index's native order. Iteration
+            // 2+ prioritizes outputs whose current best synthetic still
+            // contains a producible (non-base) item: those are exactly the
+            // recipes where this iteration's newly-folded producers can do
+            // new work. Outputs whose best is already fully reduced get
+            // processed only if budget remains - substituting them again
+            // just inflates variant count for already-covered recipes.
+            //
+            // Without this ordering, the per-recipe combinatorial explosion
+            // in iteration 2 (~9x growth on heavy modpacks) eats the
+            // maxSyntheticCount budget in hash-order before reaching every
+            // recipe that has unresolved intermediates - so things like
+            // comparator (whose iteration-1 best still carries
+            // `redstone_torch` as a pseudo-base) never get the substitution
+            // pass that would reduce them to {log, redstone, ...} and
+            // {log, redstone_block, ...}.
+            Iterable<Item> orderedOutputs;
+            if (firstPass) {
+                orderedOutputs = index.getAllOutputItems();
+            } else {
+                // Collect outputs whose current best synthetic still contains
+                // a producible (non-base) item. These are the recipes that
+                // can actually benefit from this iteration's newly-folded
+                // producers. We skip fully-reduced outputs entirely: their
+                // iteration-1 syntheics already cover them and iteration-2
+                // substitutions on them just inflate variant count without
+                // enabling new craft paths.
+                Set<Item> highPriority = new HashSet<>();
+                for (SyntheticRecipe syn : best.values()) {
+                    Item out = syn.output().getItem();
+                    if (highPriority.contains(out)) continue;
+                    for (Item costItem : syn.baseCosts().keySet()) {
+                        if (producibleItems.contains(costItem)) {
+                            highPriority.add(out);
+                            break;
+                        }
+                    }
+                }
+                // Sort priority outputs by minimum ingredient-slot count of
+                // any producing recipe, ascending. Recipes with fewer slots
+                // produce fewer combinations, so processing them first lets
+                // the budget cover the most distinct outputs before any one
+                // explosive recipe consumes the rest. Without this, hash-
+                // order processing means a single output with a 6-slot
+                // recipe can eat the entire budget and starve everything
+                // after it (including comparator at ~3 slots).
+                List<Item> ordered = new ArrayList<>(highPriority);
+                ordered.sort(Comparator.comparingInt(out -> minIngredientSlots(out, index)));
+                orderedOutputs = ordered;
+                int skipped = index.getAllOutputItems().size() - highPriority.size();
+                Fabricate.LOGGER.info("[FAB-gen] iteration {} priority queue: {} outputs with unresolved intermediates, {} fully-reduced outputs skipped",
+                    iteration, highPriority.size(), skipped);
+            }
+
+            // Per-output additions cap for iteration 2+. Prevents any
+            // single output (especially explosive multi-recipe outputs near
+            // the front of the sort order) from consuming the iteration's
+            // share of the budget and starving outputs after it. With
+            // ~1.2k priority outputs at cap 200, iteration 2 grows by at
+            // most ~240k entries regardless of which recipes are heavy -
+            // bounded behavior across iterations 2-5 without needing the
+            // global cap to bail mid-queue (which is what was missing
+            // comparator). Set to MAX_VALUE in iteration 1 because the
+            // global hardCap is the only safety net then.
+            final int perOutputCap = firstPass ? Integer.MAX_VALUE : 200;
+
         outerRecipeLoop:
-        for (Item outputItem : index.getAllOutputItems()) {
+        for (Item outputItem : orderedOutputs) {
+            int sizeAtOutputStart = best.size();
             for (Recipe<?> recipe : index.getRecipesProducing(outputItem)) {
                 if (best.size() > hardCap) {
                     hitHardCap = true;
                     break outerRecipeLoop;
                 }
+                if (best.size() - sizeAtOutputStart >= perOutputCap) break;
                 if (firstPass) recipesExamined++;
                 Map<Item, Integer> ingredients = flattenVanillaIngredients(recipe, allBaseItems);
                 if (ingredients == null || ingredients.size() < 2) continue;
@@ -376,7 +445,7 @@ public class GraphWalker {
                 long totalCombinations = 1;
                 for (List<SubOption> opts : allOptions) {
                     totalCombinations *= opts.size();
-                    if (totalCombinations > 200000) { tooMany = true; break; }
+                    if (totalCombinations > 1000000) { tooMany = true; break; }
                 }
                 if (tooMany) continue;
 
@@ -389,10 +458,16 @@ public class GraphWalker {
                 // recipe somehow reports an empty result.
                 int outputCount = Math.max(1, index.getOutput(recipe).getCount());
 
-                // Generate all valid combinations
+                // Generate all valid combinations. sizeLimit caps total
+                // best.size() for this output across all its recipes; the
+                // recursion checks it before each insert so a single
+                // explosive recipe can't blow past perOutputCap.
+                int sizeLimit = perOutputCap == Integer.MAX_VALUE
+                    ? Integer.MAX_VALUE
+                    : sizeAtOutputStart + perOutputCap;
                 generateCombinations(allOptions, 0,
                     new LinkedHashMap<>(), new HashMap<>(), 0,
-                    outputItem, outputCount, minInputCount, maxInputCount, best);
+                    outputItem, outputCount, minInputCount, maxInputCount, best, sizeLimit);
             }
         }
 
@@ -712,13 +787,20 @@ public class GraphWalker {
             Map<Item, Integer> currentCost, Map<Item, Integer> currentByproducts,
             int currentTotal,
             Item outputItem, int outputCount, int minInputCount, int maxInputCount,
-            Map<String, SyntheticRecipe> best) {
+            Map<String, SyntheticRecipe> best, int sizeLimit) {
 
         // Prune: any extension of this branch only grows currentTotal, so
         // once we're over the cap the whole subtree is dead. Cuts the 50k
         // combinatorial cap by ~orders of magnitude on recipes with bulky
         // substitutions (e.g. iron_block → 9 ingots per slot).
         if (currentTotal > maxInputCount) return;
+
+        // Per-output cap (iteration 2+ only). Once this output has filled
+        // its slice of the budget, abandon the rest of its combinations.
+        // sizeLimit is Integer.MAX_VALUE in iteration 1 so the check is a
+        // no-op there. Approximate (best.merge can replace without growth)
+        // but close enough to bound iteration 2+ growth.
+        if (best.size() >= sizeLimit) return;
 
         if (idx == allOptions.size()) {
             if (currentCost.size() < 2) return;
@@ -744,7 +826,7 @@ public class GraphWalker {
 
             generateCombinations(allOptions, idx + 1, currentCost, currentByproducts,
                 currentTotal + option.costTotal,
-                outputItem, outputCount, minInputCount, maxInputCount, best);
+                outputItem, outputCount, minInputCount, maxInputCount, best, sizeLimit);
 
             option.cost.forEach((item, count) -> {
                 int v = currentCost.get(item) - count;
@@ -904,5 +986,24 @@ public class GraphWalker {
             if (producibleItems.contains(i)) n++;
         }
         return n;
+    }
+
+    /**
+     * Minimum non-empty-ingredient-slot count across all recipes producing
+     * {@code out}. Used by phase 2's priority queue to sort outputs from
+     * cheapest-to-substitute (few slots, few combinations) to most expensive,
+     * so the budget covers the widest variety of recipes before any single
+     * explosive recipe consumes the rest.
+     */
+    private static int minIngredientSlots(Item out, RecipeIndex index) {
+        int min = Integer.MAX_VALUE;
+        for (Recipe<?> r : index.getRecipesProducing(out)) {
+            int slots = 0;
+            for (Ingredient ing : r.getIngredients()) {
+                if (!ing.isEmpty()) slots++;
+            }
+            if (slots < min) min = slots;
+        }
+        return min;
     }
 }
