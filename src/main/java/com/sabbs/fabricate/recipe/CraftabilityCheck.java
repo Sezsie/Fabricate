@@ -33,9 +33,9 @@ public final class CraftabilityCheck {
 
         Map<Item, Integer> required = RefundRegistry.getRequiredItems(recipeId);
         if (required.isEmpty()) return false;
-        Map<Item, Integer> have = tallyInventory(player.getInventory(), required.keySet());
+        Map<Item, Integer> invCounts = tallyAll(player.getInventory());
         for (var entry : required.entrySet()) {
-            if (have.getOrDefault(entry.getKey(), 0) < entry.getValue()) return false;
+            if (countWithEquivalents(invCounts, entry.getKey()) < entry.getValue()) return false;
         }
         return true;
     }
@@ -49,12 +49,18 @@ public final class CraftabilityCheck {
         Map<Item, Integer> required = RefundRegistry.getRequiredItems(recipeId);
         if (required.isEmpty()) return 0;
 
-        Map<Item, Integer> have = tallyInventory(player.getInventory(), required.keySet());
+        Map<Item, Integer> invCounts = tallyAll(player.getInventory());
         int max = Integer.MAX_VALUE;
         for (var entry : required.entrySet()) {
             int perBatch = entry.getValue();
             if (perBatch <= 0) continue;
-            int batches = have.getOrDefault(entry.getKey(), 0) / perBatch;
+            // Count not just the exact required item, but also any item the
+            // player has that's tag-equivalent (oak_log + stripped_oak_log
+            // both count toward "needs oak_log"). This is how synthetics
+            // become variant-agnostic without exploding the synthetic count
+            // - the matching layer absorbs the variance.
+            int have = countWithEquivalents(invCounts, entry.getKey());
+            int batches = have / perBatch;
             if (batches < max) max = batches;
             if (max == 0) return 0;
         }
@@ -165,5 +171,36 @@ public final class CraftabilityCheck {
             if (keys.contains(item)) counts.merge(item, stack.getCount(), Integer::sum);
         }
         return counts;
+    }
+
+    /**
+     * Full inventory tally, item → count, no filter. Used when callers
+     * need to check tag-equivalent counts and the equivalence set isn't
+     * known in advance (so filtering by required-set up front would miss
+     * substituents).
+     */
+    private static Map<Item, Integer> tallyAll(Inventory inv) {
+        Map<Item, Integer> counts = new HashMap<>();
+        int size = inv.getContainerSize();
+        for (int i = 0; i < size; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+        return counts;
+    }
+
+    /**
+     * Sum of inventory counts for {@code required} plus any tag-equivalent
+     * substitutes. Two items are tag-equivalent if they share at least one
+     * tag that's used as an ingredient in a vanilla crafting recipe.
+     */
+    private static int countWithEquivalents(Map<Item, Integer> invCounts, Item required) {
+        int sum = invCounts.getOrDefault(required, 0);
+        for (Item eq : TagEquivalence.equivalents(required)) {
+            if (eq == required) continue;
+            sum += invCounts.getOrDefault(eq, 0);
+        }
+        return sum;
     }
 }

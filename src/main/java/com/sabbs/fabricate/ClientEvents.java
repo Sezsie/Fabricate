@@ -126,6 +126,7 @@ public class ClientEvents {
         // reference itself can persist across reloads while its contents
         // change; reference-identity isn't a reliable invalidation trigger.
         RecipeSelector.invalidate();
+        com.sabbs.fabricate.recipe.TagEquivalence.invalidate();
         if (!ModConfig.ENABLED.get()) {
             Fabricate.LOGGER.info("[FAB-client] ModConfig.ENABLED=false  skipping");
             return;

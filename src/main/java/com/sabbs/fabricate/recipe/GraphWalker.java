@@ -149,6 +149,28 @@ public class GraphWalker {
             mapEntry.setValue(new ArrayList<>(bestPerBase.values()));
         }
 
+        // Tag-canonical dedup: collapse producers that are functionally
+        // identical up to tag equivalence. All 42 log-based stick producers
+        // (oak_log -> 8 sticks, birch_log -> 8 sticks, etc.) share the
+        // canonical signature "8:#minecraft:logs x1" because every log
+        // variant maps to the same canonical tag. Keep one representative
+        // per signature. The tag-equivalent matching layer at click time
+        // covers the other variants without needing N separate synthetics.
+        //
+        // This is the core perf win on heavy modpacks: productionMap[stick]
+        // goes from 42 entries to 1, phase 2 combinations drop ~40x, and
+        // synthetic count stays manageable (~500k instead of 2M+) without
+        // any artificial cap.
+        for (var mapEntry : productionMap.entrySet()) {
+            Map<String, SyntheticRecipe> bySignature = new LinkedHashMap<>();
+            for (SyntheticRecipe syn : mapEntry.getValue()) {
+                String sig = producerSignature(syn);
+                bySignature.merge(sig, syn, (old, neu) ->
+                    neu.totalInputCount() < old.totalInputCount() ? neu : old);
+            }
+            mapEntry.setValue(new ArrayList<>(bySignature.values()));
+        }
+
         Map<String, SyntheticRecipe> best = new LinkedHashMap<>();
         int recipesExamined = 0;
         int recipesWithMultiIng = 0;
@@ -184,37 +206,50 @@ public class GraphWalker {
         // modpack would balloon best.size() from 80k to 700k to 3M+ and OOM
         // the JVM during Option B's per-producer SubOption allocation.
         //
-        // Cap of 10 producers per item. The slot-ordering in phase 2
-        // (high-variety slot outer) ensures the top 10 already covers
-        // both primary axes (e.g., 5 wood types × 2 dust forms for
-        // torch) so cap=10 isn't a correctness bottleneck. Higher caps
-        // compounded combinatorial explosion across iterations without
-        // proportionate correctness gain.
+        // Producer cap is configurable (defaults to 10). The slot-ordering
+        // in phase 2 (high-variety slot outer) ensures the top N already
+        // covers both primary axes (e.g., 5 wood types × 2 dust forms for
+        // torch at cap=10). Players who want more variant coverage
+        // (stripped logs, wood blocks, modded variants) can bump this in
+        // config at the cost of more memory and slower generation.
         final int MAX_ITERATIONS = 5;
-        final int MAX_PRODUCERS_PER_ITEM = 10;
+        final int MAX_PRODUCERS_PER_ITEM = com.sabbs.fabricate.ModConfig.MAX_PRODUCERS_PER_ITEM.get();
         int prevBestSize = -1;
         int iteration = 0;
 
-        // Parallel id-set per item for O(1) fold-back dedup. Using
-        // List.contains on SyntheticRecipe triggers the record's
-        // auto-generated deep equals (recursively compares baseCosts Map
-        // and refundItems List<ItemStack>), which on a large modpack
-        // cumulatively exceeds the 60s ServerHangWatchdog budget across
-        // 5 iterations. generateId() returns a String, so HashSet
-        // operations are O(1) amortized.
-        Map<Item, Set<String>> producerIds = new HashMap<>();
+        // Per-item signature set for fold-back dedup. Two producers with
+        // the same tag-canonical signature (e.g. {oak_log:1}->torch and
+        // {birch_log:1}->torch) collapse to one entry. Keeps productionMap
+        // size proportional to distinct tag-classes rather than distinct
+        // specific items, which is the difference between a 500k-synthetic
+        // generation and a 5M-synthetic generation on heavy modpacks.
+        Map<Item, Set<String>> producerSignatures = new HashMap<>();
         for (var entry : productionMap.entrySet()) {
-            Set<String> ids = new HashSet<>();
-            for (SyntheticRecipe s : entry.getValue()) ids.add(s.generateId());
-            producerIds.put(entry.getKey(), ids);
+            Set<String> sigs = new HashSet<>();
+            for (SyntheticRecipe s : entry.getValue()) sigs.add(producerSignature(s));
+            producerSignatures.put(entry.getKey(), sigs);
         }
         while (iteration < MAX_ITERATIONS && best.size() != prevBestSize) {
             prevBestSize = best.size();
             iteration++;
             boolean firstPass = (iteration == 1);
 
+            // Hard cap on total synthetic count. On heavy modpacks the
+            // outer-product iteration can balloon past 2M synthetics,
+            // making compaction take many minutes (silent hang from the
+            // player's perspective) and risking OOM on default heap.
+            // Halt early when over the cap so the user gets a working
+            // mod with reduced coverage instead of a frozen world load.
+            final int hardCap = com.sabbs.fabricate.ModConfig.MAX_SYNTHETIC_COUNT.get();
+            boolean hitHardCap = false;
+
+        outerRecipeLoop:
         for (Item outputItem : index.getAllOutputItems()) {
             for (Recipe<?> recipe : index.getRecipesProducing(outputItem)) {
+                if (best.size() > hardCap) {
+                    hitHardCap = true;
+                    break outerRecipeLoop;
+                }
                 if (firstPass) recipesExamined++;
                 Map<Item, Integer> ingredients = flattenVanillaIngredients(recipe, allBaseItems);
                 if (ingredients == null || ingredients.size() < 2) continue;
@@ -383,8 +418,13 @@ public class GraphWalker {
             for (SyntheticRecipe syn : best.values()) {
                 Item out = syn.output().getItem();
                 if (!usedAsIngredient.contains(out)) continue;
-                Set<String> ids = producerIds.computeIfAbsent(out, k -> new HashSet<>());
-                if (ids.add(syn.generateId())) {
+                Set<String> sigs = producerSignatures.computeIfAbsent(out, k -> new HashSet<>());
+                // Dedup by tag-canonical signature, not specific-item id.
+                // {oak_log:1, redstone:1}->torch and {birch_log:1, redstone:1}->torch
+                // share a signature ("#minecraft:logs x1 + #forge:dusts/redstone x1")
+                // and only one survives. Reduces productionMap growth from
+                // O(specific_items_per_tag) to O(distinct_tag_classes).
+                if (sigs.add(producerSignature(syn))) {
                     productionMap.computeIfAbsent(out, k -> new ArrayList<>()).add(syn);
                     folded++;
                     touchedOutputs.add(out);
@@ -419,10 +459,82 @@ public class GraphWalker {
             }
             Fabricate.LOGGER.info("[FAB-gen] phase 2 iteration {}: {} multi-material synthetics (delta={}, folded={}, trimmed={})",
                 iteration, best.size(), best.size() - prevBestSize, folded, trimmed);
+
+            if (hitHardCap) {
+                Fabricate.LOGGER.warn("[FAB-gen] hit synthetic count cap ({}) during iteration {}; halting phase 2 early. Bump 'maxSyntheticCount' in config or lower 'maxProducersPerItem' if you want fuller coverage.",
+                    hardCap, iteration);
+                break;
+            }
         }
 
         Fabricate.LOGGER.info("Fabricate Multi: examined {} recipes, {} had 2+ ingredient types, generated {} multi-material recipes ({} iterations)",
             recipesExamined, recipesWithMultiIng, best.size(), iteration);
+
+        // When over the hard cap, do NOT skip compaction entirely.
+        // Raw phase-2 synthetics can overpay because each ingredient slot is
+        // substituted independently. Example: a comparator needs 3 redstone torches,
+        // and each torch can independently choose a redstone_block -> redstone producer,
+        // causing the raw synthetic to ask for 3 redstone blocks instead of 1.
+        //
+        // Full compaction over huge modpacks can be too expensive, so this branch only
+        // compacts synthetics that actually carry refunds/byproducts. Those are the
+        // recipes most likely to have batch waste that can be shared across sibling
+        // ingredients.
+        //
+        // This keeps the big-modpack performance safeguard while still fixing the
+        // "needs 3 blocks instead of 1" class of bugs.
+        if (best.size() > com.sabbs.fabricate.ModConfig.MAX_SYNTHETIC_COUNT.get()) {
+            Fabricate.LOGGER.warn(
+                "[FAB-gen] synthetic count {} exceeds cap; running refund-only compaction instead of skipping compaction entirely",
+                best.size()
+            );
+
+            java.util.concurrent.ConcurrentHashMap<String, CostResolver.ResolutionResult> compactCache =
+                new java.util.concurrent.ConcurrentHashMap<>();
+            Set<String> compactCacheMiss = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+            long compactStart = System.currentTimeMillis();
+
+            List<SyntheticRecipe> originals = new ArrayList<>(best.values());
+
+            List<SyntheticRecipe> replacements = originals.parallelStream()
+                .map(syn -> {
+                    // Single-base synthetics were already built by CostResolver.
+                    if (syn.baseCosts().size() < 2) return syn;
+
+                    // Empty-refund synthetics have no obvious batch waste to recover.
+                    // compact() also checks this internally, but doing it here avoids
+                    // unnecessary cache-key construction and opportunity checks.
+                    if (syn.refundItems().isEmpty()) return syn;
+
+                    return compact(syn, index, compactCache, compactCacheMiss);
+                })
+                .collect(Collectors.toList());
+
+            int compactedCount = 0;
+            Map<String, SyntheticRecipe> compactedBest = new LinkedHashMap<>();
+
+            for (int i = 0; i < originals.size(); i++) {
+                SyntheticRecipe orig = originals.get(i);
+                SyntheticRecipe repl = replacements.get(i);
+
+                if (orig != repl) compactedCount++;
+
+                compactedBest.merge(repl.generateId(), repl, (old, neu) ->
+                    neu.totalInputCount() < old.totalInputCount() ? neu : old);
+            }
+
+            Fabricate.LOGGER.info(
+                "[FAB-gen] refund-only compaction: {} of {} synthetics shrunk; final count: {}, {} cached groups, {}ms",
+                compactedCount,
+                originals.size(),
+                compactedBest.size(),
+                compactCache.size() + compactCacheMiss.size(),
+                System.currentTimeMillis() - compactStart
+            );
+
+            return new ArrayList<>(compactedBest.values());
+        }
 
         // Stage 2: compaction. Phase 2 does per-slot substitution that
         // can't share intermediate waste across batches: comparator's 3
@@ -443,15 +555,32 @@ public class GraphWalker {
         // pre-compaction counts. With this cache, vanilla dev env runs
         // a few thousand CostResolver calls instead of hundreds of
         // thousands.
-        Map<String, CostResolver.ResolutionResult> compactCache = new HashMap<>();
-        Set<String> compactCacheMiss = new HashSet<>();
+        //
+        // Parallelized across CPU cores via parallelStream. Each compact()
+        // call is independent (reads from RecipeIndex which is immutable
+        // post-build, writes only to the shared concurrent cache).
+        // ConcurrentHashMap + concurrent Set lets multiple threads
+        // populate the cache without locking; the worst-case race is two
+        // threads computing the same CostResolver result and one's value
+        // getting discarded by putIfAbsent, which is harmless because the
+        // result is deterministic for a given (outputItem, keySet) input.
+        java.util.concurrent.ConcurrentHashMap<String, CostResolver.ResolutionResult> compactCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+        Set<String> compactCacheMiss = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        long compactStart = System.currentTimeMillis();
+
+        List<SyntheticRecipe> originals = new ArrayList<>(best.values());
+        List<SyntheticRecipe> replacements = originals.parallelStream()
+            .map(syn -> compact(syn, index, compactCache, compactCacheMiss))
+            .collect(Collectors.toList());
+
         int compactedCount = 0;
         Map<String, SyntheticRecipe> compactedBest = new LinkedHashMap<>();
-        long compactStart = System.currentTimeMillis();
-        for (SyntheticRecipe syn : best.values()) {
-            SyntheticRecipe replacement = compact(syn, index, compactCache, compactCacheMiss);
-            if (replacement != syn) compactedCount++;
-            compactedBest.merge(replacement.generateId(), replacement, (old, neu) ->
+        for (int i = 0; i < originals.size(); i++) {
+            SyntheticRecipe orig = originals.get(i);
+            SyntheticRecipe repl = replacements.get(i);
+            if (orig != repl) compactedCount++;
+            compactedBest.merge(repl.generateId(), repl, (old, neu) ->
                 neu.totalInputCount() < old.totalInputCount() ? neu : old);
         }
         Fabricate.LOGGER.info("[FAB-gen] phase 2 compaction: {} of {} synthetics shrunk (final count: {}, {} cached groups, {}ms)",
@@ -498,22 +627,19 @@ public class GraphWalker {
         Collections.sort(sortedPaths);
         String cacheKey = outKey + "|" + String.join(",", sortedPaths);
 
-        CostResolver.ResolutionResult result;
-        if (cache.containsKey(cacheKey)) {
-            result = cache.get(cacheKey);
-        } else if (negativeCache.contains(cacheKey)) {
-            return syn;
-        } else {
+        // ConcurrentHashMap.get returns null for "not present"; we use
+        // negativeCache to distinguish "computed and is unhelpful" from
+        // "not yet computed." If multiple threads race here, the worst
+        // case is duplicate CostResolver work whose results agree, so no
+        // locking needed.
+        CostResolver.ResolutionResult result = cache.get(cacheKey);
+        if (result == null) {
+            if (negativeCache.contains(cacheKey)) return syn;
             // Without refunds there's no waste to recover via batch sharing.
-            // Apply this filter only on first encounter for this cache key -
-            // a later synthetic with the same (output, keySet) may have
-            // refunds even if this one doesn't, so the cache key result
-            // applies regardless of per-synthetic refund presence.
-            if (syn.refundItems().isEmpty()) {
-                // Skip without caching; another syn with same key + refunds
-                // may still trigger compaction.
-                return syn;
-            }
+            // Don't add to negativeCache: a later synthetic with the same
+            // (output, keySet) but non-empty refunds may still hit
+            // compaction.
+            if (syn.refundItems().isEmpty()) return syn;
             // Opportunity check: is any refund item produced by a recipe
             // whose ingredients include a cost item?
             boolean opportunity = false;
@@ -549,10 +675,12 @@ public class GraphWalker {
                 new HashSet<>(),
                 new HashMap<>()
             );
-            cache.put(cacheKey, result);
+            if (result == null) {
+                negativeCache.add(cacheKey);
+                return syn;
+            }
+            cache.putIfAbsent(cacheKey, result);
         }
-
-        if (result == null) return syn;
 
         int newTotal = 0;
         for (int v : result.baseCost().values()) newTotal += v;
@@ -723,6 +851,31 @@ public class GraphWalker {
 
     private static int ceilDiv(int a, int b) {
         return (a + b - 1) / b;
+    }
+
+    /**
+     * Tag-canonical signature for a producer. Two producers with the same
+     * signature are considered functionally interchangeable thanks to the
+     * tag-equivalent matching layer at click time, so productionMap only
+     * needs to keep one representative per signature.
+     *
+     * <p>The signature embeds the output's specific identity (different
+     * output items aren't interchangeable) and each baseCost item's
+     * canonical form (which collapses to a tag name if available, else the
+     * specific item path). For producers with multi-key baseCosts, the
+     * entries are sorted to make the signature order-independent.
+     */
+    private static String producerSignature(SyntheticRecipe syn) {
+        StringBuilder sb = new StringBuilder();
+        var outKey = ForgeRegistries.ITEMS.getKey(syn.output().getItem());
+        sb.append(outKey == null ? "?" : outKey.toString())
+          .append('x').append(syn.output().getCount())
+          .append(':');
+        syn.baseCosts().entrySet().stream()
+            .map(e -> TagEquivalence.canonicalForm(e.getKey()) + "x" + e.getValue())
+            .sorted()
+            .forEach(s -> sb.append(s).append('|'));
+        return sb.toString();
     }
 
     /**

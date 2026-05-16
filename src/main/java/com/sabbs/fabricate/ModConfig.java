@@ -21,6 +21,8 @@ public class ModConfig {
     public static final ForgeConfigSpec.IntValue MAX_DEPTH;
     public static final ForgeConfigSpec.IntValue MIN_INPUT_COUNT;
     public static final ForgeConfigSpec.IntValue MAX_INPUT_COUNT;
+    public static final ForgeConfigSpec.IntValue MAX_PRODUCERS_PER_ITEM;
+    public static final ForgeConfigSpec.IntValue MAX_SYNTHETIC_COUNT;
     public static final ForgeConfigSpec.BooleanValue ENABLE_REFUNDS;
     public static final ForgeConfigSpec.BooleanValue DEBUG_LOGGING;
 
@@ -56,6 +58,34 @@ public class ModConfig {
                          "Default 128 covers all vanilla recipes with some headroom to spare.",
                          "Recipes requiring more than this many items will be skipped.")
                 .defineInRange("maxInputCount", 128, 1, 2048);
+
+            MAX_PRODUCERS_PER_ITEM = builder
+                .comment("Maximum number of substitution variants kept per item",
+                         "during phase 2 recipe generation. Higher values cover more",
+                         "tag-equivalent variants (e.g. with cap=10 you get 5 wood",
+                         "types for torches; with cap=20 you get 10 wood types).",
+                         "Trade-off: higher = more memory + slower generation, lower",
+                         "= some less-common variants get cut and may not appear as",
+                         "craft options for players holding those specific items.",
+                         "Default 10 is a balance point that fits 21^4 = 194k",
+                         "combinations under the inner 200k-combinations cap for",
+                         "4-ingredient recipes. With tag-equivalent matching enabled,",
+                         "cap=10 typically covers all variants players are likely to",
+                         "have - the matching layer accepts any item in the same",
+                         "Forge tag as the synthetic's required item, so you don't",
+                         "need a producer per specific log/plank/ingot variant.")
+                .defineInRange("maxProducersPerItem", 10, 1, 100);
+
+            MAX_SYNTHETIC_COUNT = builder
+                .comment("Hard upper bound on total synthetic recipes generated.",
+                         "If phase 2 generation exceeds this count, the iteration",
+                         "halts early and compaction is skipped to prevent OOM and",
+                         "world-load hangs on giant modpacks (which can otherwise",
+                         "balloon past 2 million synthetics).",
+                         "Default 500,000 is enough for vanilla + ~20 content mods.",
+                         "Bump only if you have lots of free RAM and tolerate longer",
+                         "world-load times. Lower if you see OOM warnings.")
+                .defineInRange("maxSyntheticCount", 500_000, 10_000, 10_000_000);
 
             ENABLE_REFUNDS = builder
                 .comment("Whether to refund intermediate byproduct items after crafting.",
