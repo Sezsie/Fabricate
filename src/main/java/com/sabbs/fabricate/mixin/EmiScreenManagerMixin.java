@@ -2,6 +2,7 @@ package com.sabbs.fabricate.mixin;
 
 import com.sabbs.fabricate.Fabricate;
 import com.sabbs.fabricate.integration.emi.CraftIntent;
+import com.sabbs.fabricate.integration.emi.EmiCraftThrottle;
 import com.sabbs.fabricate.network.NetworkHandler;
 import com.sabbs.fabricate.network.PlannerCraftPacket;
 import dev.emi.emi.api.EmiApi;
@@ -36,8 +37,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * click before EMI's grid-fill ever runs.
  *
  * <p>Non-craft clicks and clicks on items the planner can't produce fall
- * through to EMI unchanged (the server silently no-ops on unreachable
- * targets).
+ * through to EMI unchanged; the server silently no-ops on unreachable
+ * targets.
+ *
+ * <p>Client-side throttling is shared with {@link EmiRecipeFillerMixin} so
+ * EMI's two packet-send paths cannot bypass each other.
  */
 @Mixin(value = EmiScreenManager.class, remap = false)
 public abstract class EmiScreenManagerMixin {
@@ -53,10 +57,19 @@ public abstract class EmiScreenManagerMixin {
         Item hovered = resolveHoveredItem();
         if (hovered == null) return;
 
+        if (EmiCraftThrottle.isOnCooldown()) {
+            Fabricate.LOGGER.debug("[FAB-EMI] throttled click {} on {} ({}ms remaining)",
+                intent,
+                hovered,
+                EmiCraftThrottle.remainingMs());
+
+            cir.setReturnValue(false);
+            return;
+        }
+
         // Translate EMI intent into (qty, toCursor) for the planner packet.
-        // CRAFT_ALL variants → up to a full stack; CRAFT_ONE → 1.
-        // toCursor only when a container screen is actually open (otherwise
-        // the cursor stack has nowhere to display and gets dropped on close).
+        // CRAFT_ALL variants -> up to a full stack; CRAFT_ONE -> 1.
+        // toCursor only when a container screen is actually open.
         boolean hasContainerScreen = Minecraft.getInstance().screen instanceof AbstractContainerScreen<?>;
         int qty;
         boolean toCursor;
@@ -70,7 +83,10 @@ public abstract class EmiScreenManagerMixin {
 
         Fabricate.LOGGER.debug("[FAB-EMI] click {} -> PlannerCraftPacket({}x {}, toCursor={})",
             intent, qty, hovered, toCursor);
+
         NetworkHandler.sendToServer(new PlannerCraftPacket(hovered, qty, toCursor));
+        EmiCraftThrottle.markAccepted();
+
         cir.setReturnValue(false);
     }
 
@@ -85,8 +101,11 @@ public abstract class EmiScreenManagerMixin {
     }
 
     private static boolean matches(EmiBind bind, int button) {
-        try { return bind != null && bind.matchesMouse(button); }
-        catch (Throwable t) { return false; }
+        try {
+            return bind != null && bind.matchesMouse(button);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** Item under the cursor, or {@code null} if EMI reports nothing hovered. */
@@ -94,6 +113,7 @@ public abstract class EmiScreenManagerMixin {
         try {
             EmiStackInteraction si = EmiApi.getHoveredStack(false);
             if (si == null || si.isEmpty()) return null;
+
             for (EmiStack es : si.getStack().getEmiStacks()) {
                 ItemStack s = es.getItemStack();
                 if (s != null && !s.isEmpty()) return s.getItem();
@@ -101,6 +121,7 @@ public abstract class EmiScreenManagerMixin {
         } catch (Throwable t) {
             Fabricate.LOGGER.debug("[FAB-EMI] resolveHoveredItem failed", t);
         }
+
         return null;
     }
 }

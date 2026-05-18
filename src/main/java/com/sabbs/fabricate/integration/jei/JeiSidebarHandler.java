@@ -3,6 +3,7 @@ package com.sabbs.fabricate.integration.jei;
 import com.sabbs.fabricate.Fabricate;
 import com.sabbs.fabricate.network.NetworkHandler;
 import com.sabbs.fabricate.network.PlannerCraftPacket;
+
 import mezz.jei.api.constants.VanillaTypes;
 import mezz.jei.api.runtime.IJeiRuntime;
 import net.minecraft.client.Minecraft;
@@ -21,6 +22,11 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
  * shift+left-click sends a stack-size batch for inventory delivery.
  * The server-side {@link com.sabbs.fabricate.planner.PlannerService}
  * decides which recipe path actually runs based on the player's inventory.
+ *
+ * <p>Client-side throttling is intentionally duplicated with server-side
+ * request validation. The client throttle prevents ordinary spam-clicking
+ * from flooding the server with queued planner requests. The server-side
+ * checks still protect against malicious or broken clients.
  */
 public final class JeiSidebarHandler {
 
@@ -29,10 +35,25 @@ public final class JeiSidebarHandler {
     /**
      * Set when we consume a left-click to trigger a craft. The corresponding
      * mouse-release must also be swallowed, otherwise vanilla's release
-     * handling (e.g. throw-cursor-outside-slot on quick re-clicks) can drop
+     * handling, such as throw-cursor-outside-slot on quick re-clicks, can drop
      * the freshly-crafted item back out of the cursor.
      */
     private static boolean swallowNextRelease = false;
+
+    /**
+     * Minimum delay between JEI-originated Fabricate craft packets.
+     *
+     * <p>This is deliberately longer than a normal double-click interval
+     * because each accepted packet may cause a full server-side planner pass.
+     * Players can still craft quickly, but hammer-clicking JEI won't enqueue
+     * dozens of expensive server tasks.
+     */
+    private static final long CLIENT_CLICK_COOLDOWN_MS = 300L;
+
+    /**
+     * Timestamp of the last JEI craft packet sent by this client.
+     */
+    private static long lastCraftPacketSentMs = 0L;
 
     @SubscribeEvent(priority = EventPriority.HIGH)
     public static void onMousePressed(ScreenEvent.MouseButtonPressed.Pre event) {
@@ -53,6 +74,15 @@ public final class JeiSidebarHandler {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.getConnection() == null) return;
 
+        if (isClientClickOnCooldown()) {
+            Fabricate.LOGGER.debug("[FAB-JEI] throttled click on {}",
+                net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(hovered.getItem()));
+
+            swallowNextRelease = true;
+            event.setCanceled(true);
+            return;
+        }
+
         Item target = hovered.getItem();
         int qty;
         boolean toCursor;
@@ -66,7 +96,10 @@ public final class JeiSidebarHandler {
 
         Fabricate.LOGGER.debug("[FAB-JEI] click -> PlannerCraftPacket({}x {}, toCursor={})",
             qty, net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(target), toCursor);
+
         NetworkHandler.sendToServer(new PlannerCraftPacket(target, qty, toCursor));
+
+        markClientClickAccepted();
         swallowNextRelease = true;
         event.setCanceled(true);
     }
@@ -77,5 +110,20 @@ public final class JeiSidebarHandler {
         if (event.getButton() != 0) return;
         swallowNextRelease = false;
         event.setCanceled(true);
+    }
+
+    /**
+     * True if this client has sent a JEI Fabricate packet too recently.
+     */
+    private static boolean isClientClickOnCooldown() {
+        long now = System.currentTimeMillis();
+        return now - lastCraftPacketSentMs < CLIENT_CLICK_COOLDOWN_MS;
+    }
+
+    /**
+     * Mark that this client just sent a JEI Fabricate packet.
+     */
+    private static void markClientClickAccepted() {
+        lastCraftPacketSentMs = System.currentTimeMillis();
     }
 }

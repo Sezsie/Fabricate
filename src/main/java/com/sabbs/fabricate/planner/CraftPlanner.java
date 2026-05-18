@@ -3,6 +3,7 @@ package com.sabbs.fabricate.planner;
 import com.sabbs.fabricate.planner.CraftGraph.IngredientSlot;
 import com.sabbs.fabricate.planner.CraftGraph.RecipeEdge;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.crafting.Recipe;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -31,21 +32,81 @@ import java.util.Set;
  * <p><b>Byproduct sharing:</b> waste from earlier steps is added to a
  * byproducts pool that subsequent slots can consume from before falling
  * back to inventory or further recursion.
+ *
+ * <p><b>Planning budget:</b> modded recipe graphs can branch insanely hard.
+ * A depth cap alone prevents infinite recursion, but it does not prevent
+ * combinatorial explosion. This planner has a hard budget for recursive
+ * resolve calls, recipe attempts, and wall-clock time so a single click
+ * cannot freeze the server thread.
  */
 public final class CraftPlanner {
 
     private static final int DEFAULT_MAX_DEPTH = 16;
 
+    /**
+     * Max recursive resolve calls per plan.
+     *
+     * <p>This counts every request to obtain some quantity of an item,
+     * including intermediate ingredients.
+     */
+    private static final int DEFAULT_MAX_RESOLVE_CALLS = 2_500;
+
+    /**
+     * Max recipe attempts per plan.
+     *
+     * <p>This counts every candidate recipe the planner tries while searching.
+     */
+    private static final int DEFAULT_MAX_RECIPE_ATTEMPTS = 1_500;
+
+    /**
+     * Max wall-clock planning time per plan.
+     *
+     * <p>This is deliberately low because planning runs on the server thread.
+     * If you want more permissive behavior later, increase this carefully.
+     */
+    private static final long DEFAULT_MAX_PLAN_TIME_MS = 35L;
+
+    /**
+     * How often the budget checks the wall clock.
+     *
+     * <p>Checking System.nanoTime constantly adds noise. Checking every 64
+     * operations is frequent enough to stop runaway searches quickly.
+     */
+    private static final int TIME_CHECK_INTERVAL = 64;
+
     private final CraftGraph graph;
     private final int maxDepth;
+    private final int maxResolveCalls;
+    private final int maxRecipeAttempts;
+    private final long maxPlanTimeNanos;
 
     public CraftPlanner(CraftGraph graph) {
-        this(graph, DEFAULT_MAX_DEPTH);
+        this(
+            graph,
+            DEFAULT_MAX_DEPTH,
+            DEFAULT_MAX_RESOLVE_CALLS,
+            DEFAULT_MAX_RECIPE_ATTEMPTS,
+            DEFAULT_MAX_PLAN_TIME_MS
+        );
     }
 
     public CraftPlanner(CraftGraph graph, int maxDepth) {
+        this(
+            graph,
+            maxDepth,
+            DEFAULT_MAX_RESOLVE_CALLS,
+            DEFAULT_MAX_RECIPE_ATTEMPTS,
+            DEFAULT_MAX_PLAN_TIME_MS
+        );
+    }
+
+    public CraftPlanner(CraftGraph graph, int maxDepth, int maxResolveCalls,
+                        int maxRecipeAttempts, long maxPlanTimeMs) {
         this.graph = graph;
         this.maxDepth = maxDepth;
+        this.maxResolveCalls = Math.max(1, maxResolveCalls);
+        this.maxRecipeAttempts = Math.max(1, maxRecipeAttempts);
+        this.maxPlanTimeNanos = Math.max(1L, maxPlanTimeMs) * 1_000_000L;
     }
 
     /**
@@ -65,19 +126,49 @@ public final class CraftPlanner {
      * sticks-from-planks but not wooden_shovel (top-level OR intermediate).
      */
     public Optional<CraftPlan> plan(Item target, int qty, Map<Item, Integer> inventory, boolean has3x3) {
-        // Working copy of inventory; mutated as we consume during planning.
-        // Exclude top-level target so we always craft fresh.
-        Map<Item, Integer> remainingInv = new HashMap<>(inventory);
-        remainingInv.remove(target);
+        Budget budget = new Budget(
+            target,
+            qty,
+            maxResolveCalls,
+            maxRecipeAttempts,
+            maxPlanTimeNanos
+        );
 
-        Map<Item, Integer> baseCost = new HashMap<>();
-        Map<Item, Integer> byproducts = new HashMap<>();
-        List<CraftPlan.Step> steps = new ArrayList<>();
+        try {
+            // Working copy of inventory; mutated as we consume during planning.
+            // Exclude top-level target so we always craft fresh.
+            Map<Item, Integer> remainingInv = new HashMap<>(inventory);
+            remainingInv.remove(target);
 
-        boolean ok = resolve(target, qty, remainingInv, baseCost, byproducts, steps, new HashSet<>(), 0, has3x3);
-        if (!ok) return Optional.empty();
+            Map<Item, Integer> baseCost = new HashMap<>();
+            Map<Item, Integer> byproducts = new HashMap<>();
+            List<CraftPlan.Step> steps = new ArrayList<>();
 
-        return Optional.of(new CraftPlan(target, qty, steps, baseCost, byproducts));
+            boolean ok = resolve(
+                target,
+                qty,
+                remainingInv,
+                baseCost,
+                byproducts,
+                steps,
+                new HashSet<>(),
+                0,
+                has3x3,
+                budget
+            );
+
+            if (!ok) return Optional.empty();
+
+            return Optional.of(new CraftPlan(target, qty, steps, baseCost, byproducts));
+        } catch (BudgetExceededException e) {
+            com.sabbs.fabricate.Fabricate.LOGGER.debug(
+                "[FAB-planner] planning budget exceeded for {}x {}: {}",
+                qty,
+                target,
+                e.getMessage()
+            );
+            return Optional.empty();
+        }
     }
 
     /**
@@ -88,8 +179,11 @@ public final class CraftPlanner {
     private boolean resolve(
         Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
-        List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3
+        List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
+        Budget budget
     ) {
+        budget.countResolve(target, qty, depth);
+
         // Phase 1: take what we can from inventory.
         int available = remainingInv.getOrDefault(target, 0);
         int taken = Math.min(available, qty);
@@ -116,6 +210,8 @@ public final class CraftPlanner {
         visited.add(target);
         try {
             for (RecipeEdge recipe : graph.getRecipesProducing(target)) {
+                budget.countRecipeAttempt(recipe, target, depth);
+
                 // Workstation gating: at a 2x2 inventory grid we can't
                 // execute recipes that require a full 3x3 crafting table,
                 // even as intermediate steps. The planner mimics real
@@ -128,15 +224,18 @@ public final class CraftPlanner {
                 Map<Item, Integer> bpSnap = new HashMap<>(byproducts);
                 int stepsSnap = steps.size();
 
-                if (tryRecipe(recipe, target, stillNeed, remainingInv, baseCost, byproducts, steps, visited, depth, has3x3)) {
+                if (tryRecipe(recipe, target, stillNeed, remainingInv, baseCost,
+                    byproducts, steps, visited, depth, has3x3, budget)) {
                     return true;
                 }
+
                 // Recipe failed - restore state and try the next one.
                 restore(remainingInv, invSnap);
                 restore(baseCost, baseSnap);
                 restore(byproducts, bpSnap);
                 while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
             }
+
             // No recipe worked - roll back the original inventory take.
             if (taken > 0) {
                 remainingInv.merge(target, taken, Integer::sum);
@@ -157,8 +256,11 @@ public final class CraftPlanner {
     private boolean tryRecipe(
         RecipeEdge recipe, Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
-        List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3
+        List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
+        Budget budget
     ) {
+        budget.checkTimeOnly();
+
         int outputPerBatch = Math.max(1, recipe.outputCount());
         int batches = ceilDiv(qty, outputPerBatch);
         int produced = batches * outputPerBatch;
@@ -169,6 +271,7 @@ public final class CraftPlanner {
         // "need 8 planks" entry).
         Map<Set<Item>, Integer> aggregated = new LinkedHashMap<>();
         for (IngredientSlot slot : recipe.inputs()) {
+            budget.checkTimeOnly();
             aggregated.merge(slot.acceptedItems(), batches, Integer::sum);
         }
 
@@ -180,12 +283,16 @@ public final class CraftPlanner {
         Map<Item, Integer> stepConsumed = new HashMap<>();
 
         for (var entry : aggregated.entrySet()) {
+            budget.checkTimeOnly();
+
             Set<Item> acceptedSet = entry.getKey();
             int needQty = entry.getValue();
 
             // Phase A: reuse from byproducts pool. Sibling slots from earlier
             // in this recipe may have produced waste this slot can consume.
             for (Item candidate : acceptedSet) {
+                budget.checkTimeOnly();
+
                 if (needQty == 0) break;
                 int avail = byproducts.getOrDefault(candidate, 0);
                 if (avail <= 0) continue;
@@ -202,12 +309,18 @@ public final class CraftPlanner {
             // partial inventory takes + recipe recursion internally.
             Item chosen = null;
             int chosenQty = needQty;
-            for (Item accepted : preferredOrder(acceptedSet, remainingInv)) {
-                if (resolve(accepted, needQty, remainingInv, baseCost, byproducts, steps, visited, depth + 1, has3x3)) {
+
+            List<Item> orderedCandidates = preferredOrder(acceptedSet, remainingInv);
+            for (Item accepted : orderedCandidates) {
+                budget.checkTimeOnly();
+
+                if (resolve(accepted, needQty, remainingInv, baseCost, byproducts,
+                    steps, visited, depth + 1, has3x3, budget)) {
                     chosen = accepted;
                     break;
                 }
             }
+
             if (chosen == null) {
                 // No accepted item could be satisfied; abandon this recipe.
                 restore(remainingInv, invSnap);
@@ -216,12 +329,91 @@ public final class CraftPlanner {
                 while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
                 return false;
             }
+
             stepConsumed.merge(chosen, chosenQty, Integer::sum);
         }
 
         if (waste > 0) byproducts.merge(target, waste, Integer::sum);
+
+        // Compute remainders via the recipe's own getRemainingItems, which
+        // catches recipe-level overrides (GregTech hammers, modded tools)
+        // that the Item-level hasCraftingRemainingItem check misses.
+        addRecipeRemainders(recipe, stepConsumed, batches, byproducts);
+
         steps.add(new CraftPlan.Step(recipe, batches, stepConsumed));
         return true;
+    }
+
+    /**
+     * Add crafting remainders to {@code byproducts} by invoking the recipe's
+     * own {@code getRemainingItems}. Buckets and Item-level remainders are
+     * handled by the default impl; modded recipes that override (GregTech
+     * hammers, Tinkers tools, etc.) are caught via the override.
+     *
+     * <p>Builds a per-batch 3x3 {@link net.minecraft.world.inventory.TransientCraftingContainer}
+     * from {@code stepConsumed} divided by {@code batches}, calls the recipe,
+     * then scales the returned per-batch remainders by {@code batches}.
+     * Slot positions are arbitrary - the default {@code getRemainingItems}
+     * is position-agnostic and modded overrides typically iterate slots
+     * looking for specific items rather than checking specific positions.
+     *
+     * <p>Falls back to the Item-level remainder check on any exception
+     * (e.g. a position-sensitive override that doesn't like our arbitrary
+     * placement, or a recipe class that NPEs on the null menu reference).
+     */
+    private static void addRecipeRemainders(RecipeEdge edge, Map<Item, Integer> stepConsumed,
+                                            int batches, Map<Item, Integer> byproducts) {
+        Recipe<?> raw = edge.sourceRecipe();
+        if (!(raw instanceof net.minecraft.world.item.crafting.CraftingRecipe craftingRecipe)) {
+            addItemLevelRemainders(stepConsumed, byproducts);
+            return;
+        }
+
+        // Per-batch container reflects one craft cycle (1 hammer + 2 ingots,
+        // not N hammers + 2N ingots). Recipe returns per-batch remainders,
+        // we scale by batches when merging into byproducts.
+        net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> slots =
+            net.minecraft.core.NonNullList.withSize(9, net.minecraft.world.item.ItemStack.EMPTY);
+        int slotIdx = 0;
+        for (var e : stepConsumed.entrySet()) {
+            int perBatch = e.getValue() / batches;
+            for (int i = 0; i < perBatch && slotIdx < 9; i++) {
+                slots.set(slotIdx++, new net.minecraft.world.item.ItemStack(e.getKey()));
+            }
+        }
+
+        try {
+            net.minecraft.world.inventory.CraftingContainer container =
+                new net.minecraft.world.inventory.TransientCraftingContainer(null, 3, 3, slots);
+            net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> remainders =
+                craftingRecipe.getRemainingItems(container);
+            for (net.minecraft.world.item.ItemStack r : remainders) {
+                if (r.isEmpty()) continue;
+                byproducts.merge(r.getItem(), r.getCount() * batches, Integer::sum);
+            }
+        } catch (Throwable t) {
+            com.sabbs.fabricate.Fabricate.LOGGER.debug(
+                "[FAB] recipe.getRemainingItems failed for {}: {} - falling back to Item-level",
+                edge.id(), t.toString());
+            addItemLevelRemainders(stepConsumed, byproducts);
+        }
+    }
+
+    /**
+     * Fallback: produce remainders using the Item-level API. Catches
+     * vanilla-style remainders (buckets, anything that overrides
+     * {@code Item.hasCraftingRemainingItem}) but misses recipe-level
+     * overrides. Used when {@link #addRecipeRemainders} can't get a
+     * working CraftingContainer.
+     */
+    private static void addItemLevelRemainders(Map<Item, Integer> stepConsumed, Map<Item, Integer> byproducts) {
+        for (var e : stepConsumed.entrySet()) {
+            Item item = e.getKey();
+            if (!item.hasCraftingRemainingItem()) continue;
+            Item remainder = item.getCraftingRemainingItem();
+            if (remainder == null) continue;
+            byproducts.merge(remainder, e.getValue(), Integer::sum);
+        }
     }
 
     /**
@@ -259,5 +451,89 @@ public final class CraftPlanner {
 
     private static int ceilDiv(int a, int b) {
         return (a + b - 1) / b;
+    }
+
+    /**
+     * Per-plan hard budget.
+     *
+     * <p>Thrown budget failures are caught by {@link #plan}, which discards
+     * the local mutated planning state and returns Optional.empty().
+     */
+    private static final class Budget {
+        private final Item rootTarget;
+        private final int rootQty;
+        private final int maxResolveCalls;
+        private final int maxRecipeAttempts;
+        private final long deadlineNanos;
+
+        private int resolveCalls = 0;
+        private int recipeAttempts = 0;
+        private int operationsSinceTimeCheck = 0;
+
+        private Budget(Item rootTarget, int rootQty, int maxResolveCalls,
+                       int maxRecipeAttempts, long maxPlanTimeNanos) {
+            this.rootTarget = rootTarget;
+            this.rootQty = rootQty;
+            this.maxResolveCalls = maxResolveCalls;
+            this.maxRecipeAttempts = maxRecipeAttempts;
+            this.deadlineNanos = System.nanoTime() + maxPlanTimeNanos;
+        }
+
+        private void countResolve(Item target, int qty, int depth) {
+            resolveCalls++;
+            if (resolveCalls > maxResolveCalls) {
+                throw new BudgetExceededException(
+                    "resolve-call limit hit"
+                        + " root=" + rootQty + "x " + rootTarget
+                        + " current=" + qty + "x " + target
+                        + " depth=" + depth
+                        + " resolves=" + resolveCalls + "/" + maxResolveCalls
+                        + " recipeAttempts=" + recipeAttempts + "/" + maxRecipeAttempts
+                );
+            }
+            checkTimeMaybe();
+        }
+
+        private void countRecipeAttempt(RecipeEdge recipe, Item target, int depth) {
+            recipeAttempts++;
+            if (recipeAttempts > maxRecipeAttempts) {
+                throw new BudgetExceededException(
+                    "recipe-attempt limit hit"
+                        + " root=" + rootQty + "x " + rootTarget
+                        + " currentTarget=" + target
+                        + " recipe=" + recipe.id()
+                        + " depth=" + depth
+                        + " resolves=" + resolveCalls + "/" + maxResolveCalls
+                        + " recipeAttempts=" + recipeAttempts + "/" + maxRecipeAttempts
+                );
+            }
+            checkTimeMaybe();
+        }
+
+        private void checkTimeOnly() {
+            operationsSinceTimeCheck++;
+            checkTimeMaybe();
+        }
+
+        private void checkTimeMaybe() {
+            operationsSinceTimeCheck++;
+            if (operationsSinceTimeCheck < TIME_CHECK_INTERVAL) return;
+            operationsSinceTimeCheck = 0;
+
+            if (System.nanoTime() > deadlineNanos) {
+                throw new BudgetExceededException(
+                    "wall-clock limit hit"
+                        + " root=" + rootQty + "x " + rootTarget
+                        + " resolves=" + resolveCalls + "/" + maxResolveCalls
+                        + " recipeAttempts=" + recipeAttempts + "/" + maxRecipeAttempts
+                );
+            }
+        }
+    }
+
+    private static final class BudgetExceededException extends RuntimeException {
+        private BudgetExceededException(String message) {
+            super(message);
+        }
     }
 }

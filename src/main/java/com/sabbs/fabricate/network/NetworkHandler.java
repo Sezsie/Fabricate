@@ -2,11 +2,15 @@ package com.sabbs.fabricate.network;
 
 import com.sabbs.fabricate.Fabricate;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraftforge.network.NetworkDirection;
 import net.minecraftforge.network.NetworkRegistry;
+import net.minecraftforge.network.PacketDistributor;
 import net.minecraftforge.network.simple.SimpleChannel;
 
 public class NetworkHandler {
     private static final String PROTOCOL_VERSION = "1";
+
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
         new ResourceLocation(Fabricate.MOD_ID, "main"),
         () -> PROTOCOL_VERSION,
@@ -18,9 +22,20 @@ public class NetworkHandler {
         // id 0 is reserved (was the legacy CraftPacket); kept free in case
         // we want to deprecate-and-replace cleanly on a wire-protocol bump.
         CHANNEL.registerMessage(1, OptOutPacket.class,
-            OptOutPacket::encode, OptOutPacket::decode, OptOutPacket::handle);
+            OptOutPacket::encode,
+            OptOutPacket::decode,
+            OptOutPacket::handle);
+
         CHANNEL.registerMessage(2, PlannerCraftPacket.class,
-            PlannerCraftPacket::encode, PlannerCraftPacket::decode, PlannerCraftPacket::handle);
+            PlannerCraftPacket::encode,
+            PlannerCraftPacket::decode,
+            PlannerCraftPacket::handle);
+
+        CHANNEL.registerMessage(3, CraftFailurePacket.class,
+            CraftFailurePacket::encode,
+            CraftFailurePacket::decode,
+            CraftFailurePacket::handle,
+            java.util.Optional.of(NetworkDirection.PLAY_TO_CLIENT));
     }
 
     public static void sendToServer(OptOutPacket packet) {
@@ -29,5 +44,9 @@ public class NetworkHandler {
 
     public static void sendToServer(PlannerCraftPacket packet) {
         CHANNEL.sendToServer(packet);
+    }
+
+    public static void sendToPlayer(ServerPlayer player, CraftFailurePacket packet) {
+        CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), packet);
     }
 }
