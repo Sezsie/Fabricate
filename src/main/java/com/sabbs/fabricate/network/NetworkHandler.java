@@ -15,17 +15,19 @@ public class NetworkHandler {
     );
 
     public static void register() {
-        CHANNEL.registerMessage(0, CraftPacket.class,
-            CraftPacket::encode, CraftPacket::decode, CraftPacket::handle);
+        // id 0 is reserved (was the legacy CraftPacket); kept free in case
+        // we want to deprecate-and-replace cleanly on a wire-protocol bump.
         CHANNEL.registerMessage(1, OptOutPacket.class,
             OptOutPacket::encode, OptOutPacket::decode, OptOutPacket::handle);
-    }
-
-    public static void sendToServer(CraftPacket packet) {
-        CHANNEL.sendToServer(packet);
+        CHANNEL.registerMessage(2, PlannerCraftPacket.class,
+            PlannerCraftPacket::encode, PlannerCraftPacket::decode, PlannerCraftPacket::handle);
     }
 
     public static void sendToServer(OptOutPacket packet) {
+        CHANNEL.sendToServer(packet);
+    }
+
+    public static void sendToServer(PlannerCraftPacket packet) {
         CHANNEL.sendToServer(packet);
     }
 }

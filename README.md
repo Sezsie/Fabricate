@@ -14,9 +14,11 @@ With Fabricate, you click on the icon of a wooden shovel in the EMI/JEI menu, th
 
 ### How does it work?
 
-Upon joining a world, Fabricate takes every crafting recipe ingame and processes their inputs and outputs, tracing its ingredients to whatever those ingredients are made from, and so on. It does this until it lands on items you actually obtain through gameplay like logs, leather, iron ingots, etc. Anything craftable along the way is treated as an "intermediate" that Fabricate remembers how to make so you don't have to. If multiple recipes can produce the same item, Fabricate ranks them by how close they are to vanilla and how few materials they need, then picks the cheapest one your inventory can actually afford.
+When you click an item in JEI or EMI's sidebar, Fabricate looks at what's actually in your inventory and walks the recipe graph backwards from the item you clicked. It treats anything you already have as a usable starting point, recurses through whatever intermediate recipes are needed (planks → sticks → shovel), and returns a single plan that says "take these raw materials, run these recipe steps, here's the item plus any leftover refunds."
 
-The result is that Fabricate makes a set of shortcut recipes. For example, a wooden shovel keeps its 1-plank-and-2-sticks recipe, but Fabricate also adds a sibling recipe that takes 1 log directly. Since Fabricate only cares about basic crafting, you cannot use the mod to automatically smelt iron ore into iron ingots, or logs into charcoal. Any crafts that require a separate process to make do not get crafted in one click. 
+That planning happens server-side on every click — there's no pre-computed list of recipes to maintain. The plan respects your current crafting grid (a 3-row recipe like wooden shovel won't plan from your 2x2 inventory grid, only at a crafting table), uses what's already in your inventory before crafting more intermediates, and refunds anything left over so you never lose materials to over-batching.
+
+Since Fabricate only handles crafting, you cannot use the mod to automatically smelt iron ore into iron ingots, or logs into charcoal. Any crafts that require a separate process do not chain.
 
 
 ### How do I use it?

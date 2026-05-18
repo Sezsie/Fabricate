@@ -5,13 +5,10 @@
     "plugin": "com.sabbs.fabricate.mixin.FabricateMixinPlugin",
     "compatibilityLevel": "JAVA_17",
     "refmap": "fabricate.refmap.json",
-    "mixins": [
-        "CraftingMenuMixin"
-    ],
+    "mixins": [],
     "client": [
         "EmiRecipeFillerMixin",
-        "EmiScreenManagerMixin",
-        "MultiPlayerGameModeMixin"
+        "EmiScreenManagerMixin"
     ],
     "injectors": {
         "defaultRequire": 1

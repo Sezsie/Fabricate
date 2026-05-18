@@ -1,7 +1,6 @@
 package com.sabbs.fabricate;
 
 import com.sabbs.fabricate.network.NetworkHandler;
-import com.sabbs.fabricate.recipe.ModRecipes;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.ModLoadingContext;
@@ -37,15 +36,11 @@ public class Fabricate {
         LOGGER.info("==================== Fabricate booting ====================");
         LOGGER.info("[FAB] dist={}, version={}", FMLEnvironment.dist, version);
 
-        LOGGER.info("[FAB] registering config specs (common + client)");
-        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, com.sabbs.fabricate.ModConfig.SPEC);
+        LOGGER.info("[FAB] registering client config spec");
         ModLoadingContext.get().registerConfig(ModConfig.Type.CLIENT, com.sabbs.fabricate.ModConfig.CLIENT_SPEC);
 
-        LOGGER.info("[FAB] registering network channel + CraftPacket");
+        LOGGER.info("[FAB] registering network channel");
         NetworkHandler.register();
-
-        LOGGER.info("[FAB] registering recipe serializer");
-        ModRecipes.register(FMLJavaModLoadingContext.get().getModEventBus());
 
         if (FMLEnvironment.dist == Dist.CLIENT) {
             LOGGER.info("[FAB] client dist  wiring recipe-viewer integrations");

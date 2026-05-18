@@ -1,29 +1,28 @@
 package com.sabbs.fabricate.mixin;
 
 import com.sabbs.fabricate.Fabricate;
-import com.sabbs.fabricate.network.CraftPacket;
 import com.sabbs.fabricate.network.NetworkHandler;
-import com.sabbs.fabricate.recipe.CraftabilityCheck;
+import com.sabbs.fabricate.network.PlannerCraftPacket;
 import dev.emi.emi.api.recipe.EmiRecipe;
 import dev.emi.emi.api.recipe.handler.EmiCraftContext;
+import dev.emi.emi.api.stack.EmiStack;
 import dev.emi.emi.registry.EmiRecipeFiller;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.item.ItemStack;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * Intercepts EMI's recipe-fill path so any Fabricate recipe  regardless
- * of which menu is open  bypasses EMI's grid-fill logic (which would let
- * Polymorph pick the alphabetically-first matching recipe) and crafts via our
- * CraftPacket instead.
+ * Intercepts EMI's recipe-fill path (the "+" button on a recipe view) and
+ * routes it through the planner instead of EMI's grid-fill logic.
  *
- * <p>This is the only entry point that catches EMI's craft-to-cursor keybind
- * on the standalone RecipeScreen when no {@code MenuType.CRAFTING} container
- * is open (e.g. clicking from the inventory screen).
+ * <p>The recipe's output item is dispatched as a {@link PlannerCraftPacket};
+ * the server picks the actual recipe path based on the player's inventory.
+ * Fires for every recipe (not just Fabricate ones) so the planner is the
+ * single source of truth for "click → craft" behavior.
  */
 @Mixin(value = EmiRecipeFiller.class, remap = false)
 public abstract class EmiRecipeFillerMixin {
@@ -36,38 +35,21 @@ public abstract class EmiRecipeFillerMixin {
             EmiCraftContext.Destination dest,
             int amount,
             CallbackInfoReturnable<Boolean> cir) {
-        ResourceLocation id = recipe == null ? null : recipe.getId();
-        if (id == null || !Fabricate.MOD_ID.equals(id.getNamespace())) return;
-        Fabricate.LOGGER.info("[FAB-EMI] performFill intercept  id={} type={} dest={} amount={}", id, type, dest, amount);
-        if (!com.sabbs.fabricate.ModConfig.CLIENT_ENABLED.get()) {
-            Fabricate.LOGGER.info("[FAB-EMI] CLIENT_ENABLED=false  returning handled(false)");
-            cir.setReturnValue(false);
-            return;
-        }
+        if (!com.sabbs.fabricate.ModConfig.CLIENT_ENABLED.get()) return;
+        if (recipe == null || recipe.getOutputs().isEmpty()) return;
 
-        if (!CraftabilityCheck.playerHasMaterials(id)) {
-            Fabricate.LOGGER.info("[FAB-EMI] performFill  missing materials for {}", id);
-            cir.setReturnValue(false);
-            return;
-        }
+        EmiStack outStack = recipe.getOutputs().get(0);
+        ItemStack itemStack = outStack.getItemStack();
+        if (itemStack == null || itemStack.isEmpty()) return;
 
-        int maxByMaterials = CraftabilityCheck.computeMaxBatches(id);
-        int requested = Math.max(1, amount);
-        int batches = Math.min(requested, maxByMaterials);
-        if (batches <= 0) {
-            cir.setReturnValue(false);
-            return;
-        }
+        int qty = Math.max(1, amount);
+        boolean toCursor = dest == EmiCraftContext.Destination.CURSOR
+            && qty == 1
+            && screen != null;
 
-        // Cursor delivery only makes sense when a real container screen hosts
-        // the click; otherwise the resulting cursor stack has nowhere to
-        // display and vanilla eventually drops it on screen close.
-        boolean hasContainerScreen = screen != null;
-        boolean toCursor = dest == EmiCraftContext.Destination.CURSOR && batches == 1 && hasContainerScreen;
-        Fabricate.LOGGER.info("[FAB-EMI] performFill dispatching {} CraftPacket(s) for {} (toCursor={})", batches, id, toCursor);
-        for (int i = 0; i < batches; i++) {
-            NetworkHandler.sendToServer(new CraftPacket(id, toCursor));
-        }
+        Fabricate.LOGGER.debug("[FAB-EMI] performFill -> PlannerCraftPacket({}x {}, toCursor={})",
+            qty, itemStack.getItem(), toCursor);
+        NetworkHandler.sendToServer(new PlannerCraftPacket(itemStack.getItem(), qty, toCursor));
         cir.setReturnValue(true);
     }
 }

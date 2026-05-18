@@ -27,6 +27,7 @@ Thumbs.db
 
 # Local backups
 .backup-*/
+backups/
 
 # Claude session data
 .claude/

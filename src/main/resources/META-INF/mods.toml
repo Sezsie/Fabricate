@@ -27,9 +27,7 @@ description='''Craft your items using base materials!'''
 # refuses to load with a clear error when neither is present. Forge's TOML
 # format has no "OR" between deps, so both are listed as mandatory=false
 # here and the requirement is enforced in code. When both are present EMI
-# wins (its recipe-reload hook is skipped on JEMI setups to avoid
-# duplicate-id errors - see EmiCompat#reloadRecipes). Dedicated servers
-# need neither.
+# wins. Dedicated servers need neither.
 [[dependencies.fabricate]]
     modId="jei"
     mandatory=false
