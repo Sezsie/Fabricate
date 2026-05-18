@@ -16,9 +16,9 @@ With Fabricate, you click on the icon of a wooden shovel in the EMI/JEI menu, th
 
 When you click an item in JEI or EMI's sidebar, Fabricate looks at what's actually in your inventory and walks the recipe graph backwards from the item you clicked. It treats anything you already have as a usable starting point, recurses through whatever intermediate recipes are needed (planks → sticks → shovel), and returns a single plan that says "take these raw materials, run these recipe steps, here's the item plus any leftover refunds."
 
-That planning happens server-side on every click — there's no pre-computed list of recipes to maintain. The plan respects your current crafting grid (a 3-row recipe like wooden shovel won't plan from your 2x2 inventory grid, only at a crafting table), uses what's already in your inventory before crafting more intermediates, and refunds anything left over so you never lose materials to over-batching.
+That planning happens server-side every time you click to craft an item via EMI or JEI. The plan respects your current crafting grid (a 3-row recipe like wooden shovel won't plan from your 2x2 inventory grid, only at a crafting table), uses what's already in your inventory before crafting more intermediates, and refunds anything left over so you never lose materials to over-batching.
 
-Since Fabricate only handles crafting, you cannot use the mod to automatically smelt iron ore into iron ingots, or logs into charcoal. Any crafts that require a separate process do not chain.
+Since Fabricate only handles crafting, you cannot use the mod to automatically smelt iron ore into iron ingots, or logs into charcoal. Any crafts that require a separate process do not work this way.
 
 
 ### How do I use it?
