@@ -60,29 +60,13 @@ public final class CraftingGridRegistry {
     }
 
     static {
-        /*
-         * Vanilla crafting table. Slot 0 is the result slot; grid starts at 1.
-         * This mirrors the CraftingTweaks-style metadata model.
-         */
+        // Vanilla. Crafting table = 3x3, inventory grid = 2x2.
+        // Slot 0 is the result slot in both; input grid starts at slot 1.
         register(CraftingMenu.class.getName(), 1, 9);
-
-        /*
-         * Vanilla player inventory crafting grid. Slot 0 is result; grid starts
-         * at 1 and has four input slots. Fabricate treats this as 2x2 access.
-         */
         register(InventoryMenu.class.getName(), 1, 4);
-
-        /*
-         * GregTech / GTCEu note:
-         *
-         * Do not guess the exact class name here until you log it from your
-         * instance. Open the GregTech crafting table and watch the
-         * [FAB-grid] menu logs. Then add a precise register(...) call below.
-         *
-         * Example shape:
-         *
-         * register("com.gregtechceu.gtceu.common.menu.SomeCraftingTableMenu", 1, 9);
-         */
+        // To add modded crafting tables: open the menu in-game, call
+        // logCurrentMenu(player) (or check [FAB-grid] debug logs), then add
+        // a register(...) line above with the exact class name.
     }
 
     public static void register(String menuClassName, int gridSlotNumber, int gridSize) {
@@ -133,16 +117,9 @@ public final class CraftingGridRegistry {
             return has3x3;
         }
 
-        /*
-         * Compatibility fallback:
-         *
-         * This intentionally exists while you're discovering GregTech's actual
-         * menu class. It lets likely crafting-table menus work without treating
-         * every random chest/furnace menu as 3x3 access.
-         *
-         * Once you know the class name, add a register(...) entry above and
-         * this fallback becomes less important.
-         */
+        // Compatibility fallback: name-substring match so likely modded
+        // crafting tables work without being explicitly registered, while
+        // chests/furnaces/etc. stay 2x2 (no false-positive 3x3 access).
         String className = menu.getClass().getName();
         String lower = className.toLowerCase(Locale.ROOT);
 

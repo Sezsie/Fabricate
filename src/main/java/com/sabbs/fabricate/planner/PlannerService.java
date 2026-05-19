@@ -10,12 +10,14 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraftforge.registries.ForgeRegistries;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The single entry point for planner-driven crafting. Wraps {@link CraftGraph},
@@ -78,13 +80,11 @@ public final class PlannerService {
     /** Compute a {@link CraftPlan} for {@code target} from the player's inventory. */
     public static Optional<CraftPlan> plan(ServerPlayer player, Item target, int qty) {
         Map<Item, Integer> inv = inventoryToMap(player.getInventory());
-        boolean has3x3 = has3x3Access(player);
+        boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
 
-        /*
-         * Useful while debugging modpack issues. If this gets too loud later,
-         * drop it to debug or gate it behind a config flag.
-         */
-        Fabricate.LOGGER.info(
+        // Per-call detail (full inventory dump) at debug so the live log isn't
+        // flooded; outcome lines (no-plan / success / failure) stay at info.
+        Fabricate.LOGGER.debug(
             "[FAB-planner] planning request: player={}, target={}, qty={}, has3x3={}, inventory={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(target),
@@ -94,17 +94,6 @@ public final class PlannerService {
         );
 
         return new CraftPlanner(getGraph(player.server)).plan(target, qty, inv, has3x3);
-    }
-
-    /**
-     * True if the player's current menu exposes a 3x3 crafting grid.
-     *
-     * <p>Vanilla is simple: InventoryMenu is 2x2, CraftingMenu is 3x3.
-     * Modded crafting tables may use custom menu classes, so this delegates to
-     * a CraftingTweaks-style registry keyed by menu class name and grid metadata.
-     */
-    private static boolean has3x3Access(ServerPlayer player) {
-        return CraftingGridRegistry.has3x3Access(player);
     }
 
     /** Items currently craftable from the player's inventory. This is optimistic and quantity-light. */
@@ -164,7 +153,7 @@ public final class PlannerService {
         Inventory pInv = player.getInventory();
         Map<Item, Integer> current = inventoryToMap(pInv);
 
-        Fabricate.LOGGER.info(
+        Fabricate.LOGGER.debug(
             "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, currentInventory={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(plan.target()),
@@ -182,7 +171,7 @@ public final class PlannerService {
 
             if (available < needed) {
                 Fabricate.LOGGER.info(
-                    "[FAB-exec] inventory changed or missing cost: player={}, item={}, needed={}, available={}",
+                    "[FAB-exec] inventory changed mid-craft: player={}, item={}, needed={}, available={}",
                     player.getGameProfile().getName(),
                     ForgeRegistries.ITEMS.getKey(item),
                     needed,
@@ -221,7 +210,7 @@ public final class PlannerService {
             giveOrDrop(player, entry.getKey(), entry.getValue());
         }
 
-        Fabricate.LOGGER.info(
+        Fabricate.LOGGER.debug(
             "[FAB-exec] executed successfully: player={}, target={}, targetCount={}, finalInventory={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(plan.target()),
@@ -241,7 +230,7 @@ public final class PlannerService {
         ItemStack carried = player.containerMenu.getCarried();
         int limit = output.getMaxStackSize();
 
-        Fabricate.LOGGER.info(
+        Fabricate.LOGGER.debug(
             "[FAB-cursor] before delivery: player={}, target={}, qty={}, carried={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(target),
@@ -268,8 +257,8 @@ public final class PlannerService {
         }
 
         if (!output.isEmpty()) {
-            Fabricate.LOGGER.info(
-                "[FAB-cursor] cursor overflow or mismatch, giving remainder to inventory: player={}, remainder={}",
+            Fabricate.LOGGER.debug(
+                "[FAB-cursor] overflow, giving remainder to inventory: player={}, remainder={}",
                 player.getGameProfile().getName(),
                 describeStack(output)
             );
@@ -285,7 +274,7 @@ public final class PlannerService {
             player.containerMenu.getCarried()
         ));
 
-        Fabricate.LOGGER.info(
+        Fabricate.LOGGER.debug(
             "[FAB-cursor] after delivery: player={}, carried={}",
             player.getGameProfile().getName(),
             describeStack(player.containerMenu.getCarried())
@@ -303,8 +292,8 @@ public final class PlannerService {
             player.getInventory().add(stack);
 
             if (!stack.isEmpty()) {
-                Fabricate.LOGGER.info(
-                    "[FAB-give] inventory full or partial, dropping leftover: player={}, stack={}",
+                Fabricate.LOGGER.debug(
+                    "[FAB-give] inventory full, dropping leftover: player={}, stack={}",
                     player.getGameProfile().getName(),
                     describeStack(stack)
                 );
@@ -325,10 +314,11 @@ public final class PlannerService {
      * slots.
      *
      * <p>Important: this dry-runs slot consumption against a temporary inventory
-     * copy. That matters for recipes with duplicate ingredients. For example,
-     * an iron sword has two iron ingot slots. If the player has only one ingot,
-     * the first slot consumes that ingot in the temporary map, and the second
-     * slot is correctly reported as missing.
+     * copy. That matters for recipes with duplicate consumable ingredients.
+     *
+     * <p>Reusable tool-like ingredients are not consumed during this dry-run.
+     * This prevents batched recipes from incorrectly reporting "64x Saw" when
+     * the same returned tool can be reused across batches.
      *
      * <p>Actionable missing-item messages are preferred over generic
      * "looked affordable but failed" messages. This matters for modpacks like
@@ -383,10 +373,19 @@ public final class PlannerService {
      *
      * @param score lower is better among candidates of the same kind
      * @param actionable true when this message tells the player a concrete item
-     *                   they are missing
+     *                   or item class they are missing
      * @param message message shown to the player
      */
     private record MissingCandidate(int score, boolean actionable, String message) {}
+
+    /**
+     * A player-facing missing ingredient entry.
+     *
+     * @param label item display name or tag label, e.g. "Iron Ingot" or
+     *              "#gtceu:tools/buzz_saws"
+     * @param reusable true when this represents a returned tool-style ingredient
+     */
+    private record MissingIngredient(String label, boolean reusable) {}
 
     /**
      * Prefer actionable messages over generic diagnostic messages.
@@ -423,21 +422,24 @@ public final class PlannerService {
         int batches = ceilDiv(Math.max(1, requestedQty), outputPerBatch);
 
         Map<Item, Integer> remaining = new HashMap<>(inventory);
-        Map<Item, Integer> missing = new HashMap<>();
+        Map<MissingIngredient, Integer> missing = new HashMap<>();
         int missingSlots = 0;
 
         for (int batch = 0; batch < batches; batch++) {
             for (CraftGraph.IngredientSlot slot : edge.inputs()) {
-                Item consumed = consumeOneAccepted(slot.acceptedItems(), remaining);
+                MissingIngredient ingredient = describeMissingIngredient(slot.acceptedItems());
+                boolean reusable = ingredient.reusable();
+
+                Item consumed = consumeOneAccepted(slot.acceptedItems(), remaining, reusable);
 
                 if (consumed != null) {
                     continue;
                 }
 
-                Item representative = chooseRepresentativeMissingItem(slot.acceptedItems());
-
-                if (representative != null) {
-                    missing.merge(representative, 1, Integer::sum);
+                if (reusable) {
+                    missing.putIfAbsent(ingredient, 1);
+                } else {
+                    missing.merge(ingredient, 1, Integer::sum);
                 }
 
                 missingSlots++;
@@ -465,11 +467,18 @@ public final class PlannerService {
      * Consume one item that can satisfy this ingredient slot from a temporary
      * inventory map.
      *
+     * <p>Reusable tool-like ingredients are not decremented, because they are
+     * expected to be returned by the recipe and reused across batches.
+     *
      * <p>Preference order:
      * 1. Any accepted item already present, highest available count first.
      * 2. Alphabetical display name as a stable tie-breaker.
      */
-    private static Item consumeOneAccepted(Set<Item> acceptedItems, Map<Item, Integer> remaining) {
+    private static Item consumeOneAccepted(
+        Set<Item> acceptedItems,
+        Map<Item, Integer> remaining,
+        boolean reusable
+    ) {
         Item best = null;
         int bestCount = 0;
 
@@ -492,29 +501,61 @@ public final class PlannerService {
             return null;
         }
 
-        dec(remaining, best, 1);
+        if (!reusable) {
+            dec(remaining, best, 1);
+        }
+
         return best;
     }
 
     /**
-     * Pick the most readable representative item for a missing ingredient slot.
+     * Describe an ingredient slot using the most useful player-facing label.
      *
-     * <p>Since CraftGraph currently stores flattened accepted item sets instead
-     * of original tag names, this chooses a stable, human-readable representative
-     * item from the accepted set.
+     * <p><b>Tag labels are reserved for tool-class slots.</b> For e.g. a
+     * GregTech buzzsaw slot accepting any of N buzzsaw tiers, the message
+     * "Missing: 1x #gtceu:tools/buzz_saws" is much more informative than
+     * pointing at one specific buzzsaw the player might not even know
+     * exists. For non-tool slots (logs, planks, ingots, etc.) we use the
+     * representative concrete item name instead - "Oak Log" is clearer
+     * than something like "#minecraft:completes_find_tree_tutorial" that
+     * happens to be the alphabetically-first tag shared by all logs and
+     * survives {@link IngredientHeuristics#tagPriority}'s default class.
+     */
+    private static MissingIngredient describeMissingIngredient(Set<Item> acceptedItems) {
+        boolean reusable = IngredientHeuristics.isReusableSlot(acceptedItems);
+
+        if (reusable) {
+            String tagLabel = IngredientHeuristics.findBestCommonTagLabel(acceptedItems);
+            if (tagLabel != null) {
+                return new MissingIngredient(tagLabel, true);
+            }
+        }
+
+        Item representative = chooseRepresentativeMissingItem(acceptedItems);
+        String label = representative == null ? "unknown ingredient" : displayItem(representative);
+
+        return new MissingIngredient(label, reusable);
+    }
+
+    /**
+     * Pick the most readable representative item for a missing ingredient slot.
      */
     private static Item chooseRepresentativeMissingItem(Set<Item> acceptedItems) {
+        if (acceptedItems == null || acceptedItems.isEmpty()) {
+            return null;
+        }
+
         return acceptedItems.stream()
             .min(Comparator.comparing(PlannerService::displayItem, String.CASE_INSENSITIVE_ORDER))
             .orElse(null);
     }
 
-    private static String formatMissingItems(Map<Item, Integer> missing) {
+    private static String formatMissingItems(Map<MissingIngredient, Integer> missing) {
         return missing.entrySet().stream()
-            .sorted(Map.Entry.<Item, Integer>comparingByValue(Comparator.reverseOrder())
-                .thenComparing(e -> displayItem(e.getKey()), String.CASE_INSENSITIVE_ORDER))
-            .map(e -> e.getValue() + "x " + displayItem(e.getKey()))
-            .collect(java.util.stream.Collectors.joining(", "));
+            .sorted(Map.Entry.<MissingIngredient, Integer>comparingByValue(Comparator.reverseOrder())
+                .thenComparing(e -> e.getKey().label(), String.CASE_INSENSITIVE_ORDER))
+            .map(e -> e.getValue() + "x " + e.getKey().label())
+            .collect(Collectors.joining(", "));
     }
 
     private static Map<Item, Integer> inventoryToMap(Inventory inv) {

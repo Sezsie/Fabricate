@@ -41,17 +41,8 @@ public final class JeiSidebarHandler {
     private static boolean swallowNextRelease = false;
 
     /**
-     * Minimum delay between JEI-originated Fabricate craft packets.
-     *
-     * <p>This is deliberately longer than a normal double-click interval
-     * because each accepted packet may cause a full server-side planner pass.
-     * Players can still craft quickly, but hammer-clicking JEI won't enqueue
-     * dozens of expensive server tasks.
-     */
-    private static final long CLIENT_CLICK_COOLDOWN_MS = 300L;
-
-    /**
-     * Timestamp of the last JEI craft packet sent by this client.
+     * Timestamp of the last JEI craft packet sent by this client. Cooldown
+     * value comes from {@link com.sabbs.fabricate.FabricateLimits#CLIENT_CLICK_COOLDOWN_MS}.
      */
     private static long lastCraftPacketSentMs = 0L;
 
@@ -117,7 +108,7 @@ public final class JeiSidebarHandler {
      */
     private static boolean isClientClickOnCooldown() {
         long now = System.currentTimeMillis();
-        return now - lastCraftPacketSentMs < CLIENT_CLICK_COOLDOWN_MS;
+        return now - lastCraftPacketSentMs < com.sabbs.fabricate.FabricateLimits.CLIENT_CLICK_COOLDOWN_MS;
     }
 
     /**

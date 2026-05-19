@@ -269,10 +269,18 @@ public final class CraftPlanner {
         // Aggregate slots with identical accepted-sets so multiple identical
         // slots batch together (e.g., 8 plank slots in a chest recipe -> one
         // "need 8 planks" entry).
+        //
+        // Reusable-tool slots (hammer, buzzsaw, wrench, ...) get aggregated
+        // at 1-per-slot instead of batches-per-slot: a single hammer
+        // satisfies all N batches because the recipe returns it untouched
+        // (per addRecipeRemainders below). Without this, "craft 11 plates
+        // with 1 hammer" fails because the planner thinks it needs 11
+        // hammers.
         Map<Set<Item>, Integer> aggregated = new LinkedHashMap<>();
         for (IngredientSlot slot : recipe.inputs()) {
             budget.checkTimeOnly();
-            aggregated.merge(slot.acceptedItems(), batches, Integer::sum);
+            int perSlot = IngredientHeuristics.isReusableSlot(slot.acceptedItems()) ? 1 : batches;
+            aggregated.merge(slot.acceptedItems(), perSlot, Integer::sum);
         }
 
         Map<Item, Integer> invSnap = new HashMap<>(remainingInv);
@@ -371,12 +379,23 @@ public final class CraftPlanner {
 
         // Per-batch container reflects one craft cycle (1 hammer + 2 ingots,
         // not N hammers + 2N ingots). Recipe returns per-batch remainders,
-        // we scale by batches when merging into byproducts.
+        // we scale non-reusable remainders by batches when merging.
+        //
+        // stepConsumed has two flavors of value:
+        //   - consumables (ingots, planks, etc):  N * batches    (multiplied at aggregation)
+        //   - reusable tools (hammer, buzzsaw):   slot-count     (NOT multiplied at aggregation)
+        //
+        // For the per-batch container slot count we want "items present
+        // during one craft cycle" - that's stepConsumed/batches for
+        // consumables and just stepConsumed for reusable tools (each batch
+        // sees the same tool again).
         net.minecraft.core.NonNullList<net.minecraft.world.item.ItemStack> slots =
             net.minecraft.core.NonNullList.withSize(9, net.minecraft.world.item.ItemStack.EMPTY);
         int slotIdx = 0;
         for (var e : stepConsumed.entrySet()) {
-            int perBatch = e.getValue() / batches;
+            int perBatch = IngredientHeuristics.isReusableItem(e.getKey())
+                ? e.getValue()
+                : e.getValue() / batches;
             for (int i = 0; i < perBatch && slotIdx < 9; i++) {
                 slots.set(slotIdx++, new net.minecraft.world.item.ItemStack(e.getKey()));
             }
@@ -389,7 +408,12 @@ public final class CraftPlanner {
                 craftingRecipe.getRemainingItems(container);
             for (net.minecraft.world.item.ItemStack r : remainders) {
                 if (r.isEmpty()) continue;
-                byproducts.merge(r.getItem(), r.getCount() * batches, Integer::sum);
+                // Mirror the per-batch math: reusable remainders (the tool
+                // itself) come back ONCE total because they were used once
+                // total. Non-reusable remainders (empty buckets, etc) come
+                // back once per batch.
+                int multiplier = IngredientHeuristics.isReusableItem(r.getItem()) ? 1 : batches;
+                byproducts.merge(r.getItem(), r.getCount() * multiplier, Integer::sum);
             }
         } catch (Throwable t) {
             com.sabbs.fabricate.Fabricate.LOGGER.debug(

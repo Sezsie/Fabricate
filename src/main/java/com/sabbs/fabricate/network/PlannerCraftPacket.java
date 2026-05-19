@@ -32,8 +32,6 @@ import java.util.function.Supplier;
  */
 public class PlannerCraftPacket {
 
-    private static final long CRAFT_COOLDOWN_MS = 150L;
-
     private static final Map<UUID, Long> LAST_CRAFT_REQUEST =
         new ConcurrentHashMap<>();
 
@@ -93,7 +91,7 @@ public class PlannerCraftPacket {
                 return;
             }
 
-            Fabricate.LOGGER.info("[FAB-packet] request from {}: qty={}, targetItemId={}, resolvedItem={}, toCursor={}",
+            Fabricate.LOGGER.debug("[FAB-packet] request from {}: qty={}, targetItemId={}, resolvedItem={}, toCursor={}",
                 player.getGameProfile().getName(),
                 msg.qty,
                 msg.targetItemId,
@@ -146,7 +144,7 @@ public class PlannerCraftPacket {
                     return;
                 }
 
-                Fabricate.LOGGER.info("[FAB-packet] crafted successfully: player={}, qty={}, target={}, consumed={}, refund={}",
+                Fabricate.LOGGER.debug("[FAB-packet] crafted successfully: player={}, qty={}, target={}, consumed={}, refund={}",
                     player.getGameProfile().getName(),
                     safeQty,
                     msg.targetItemId,
@@ -184,7 +182,7 @@ public class PlannerCraftPacket {
         int safeQty = Math.min(msg.qty, maxQty);
 
         if (safeQty != msg.qty) {
-            Fabricate.LOGGER.info("[FAB-packet] clamped qty: player={}, target={}, requested={}, safe={}",
+            Fabricate.LOGGER.debug("[FAB-packet] clamped qty: player={}, target={}, requested={}, safe={}",
                 player.getGameProfile().getName(),
                 msg.targetItemId,
                 msg.qty,
@@ -207,7 +205,7 @@ public class PlannerCraftPacket {
 
         Long last = LAST_CRAFT_REQUEST.get(id);
 
-        if (last != null && now - last < CRAFT_COOLDOWN_MS) {
+        if (last != null && now - last < com.sabbs.fabricate.FabricateLimits.SERVER_CRAFT_COOLDOWN_MS) {
             return true;
         }
 

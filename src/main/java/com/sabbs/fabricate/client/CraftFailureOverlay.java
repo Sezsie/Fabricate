@@ -27,21 +27,20 @@ public final class CraftFailureOverlay {
 
     private CraftFailureOverlay() {}
 
-    private static final long DISPLAY_MS = 10_000L;
-
     /**
-     * Maximum width of the wrapped error text as a percentage of screen width.
-     *
-     * <p>0.75 means the text can use up to 75% of the screen width before
-     * wrapping. It is also capped below so it does not become absurdly wide
-     * on large monitors.
-     */
-    private static final float MAX_TEXT_WIDTH_SCREEN_FRACTION = 0.75F;
-
-    /**
-     * Absolute max text width in scaled GUI pixels.
+     * Absolute max text width in scaled GUI pixels. The configurable
+     * fraction in {@link com.sabbs.fabricate.ModConfig#OVERLAY_MAX_WIDTH_FRACTION}
+     * is clamped against this to keep the message from spanning the entire
+     * width of an ultrawide monitor when the player has set a large fraction.
      */
     private static final int MAX_TEXT_WIDTH_PIXELS = 360;
+
+    /**
+     * Minimum wrap width in scaled GUI pixels. Prevents the text from
+     * wrapping every word when {@code maxWidthFraction} is set very small
+     * or the screen is very narrow.
+     */
+    private static final int MIN_TEXT_WIDTH_PIXELS = 120;
 
     /**
      * Space between rendered lines.
@@ -58,7 +57,7 @@ public final class CraftFailureOverlay {
     public static void show(Component newTitle, Component newDetail) {
         title = newTitle == null ? Component.empty() : newTitle;
         detail = newDetail == null ? Component.empty() : newDetail;
-        visibleUntilMs = System.currentTimeMillis() + DISPLAY_MS;
+        visibleUntilMs = System.currentTimeMillis() + com.sabbs.fabricate.FabricateLimits.FAILURE_DISPLAY_MS;
     }
 
     /**
@@ -78,22 +77,42 @@ public final class CraftFailureOverlay {
         GuiGraphics graphics = event.getGuiGraphics();
 
         int screenWidth = mc.getWindow().getGuiScaledWidth();
-        int x = screenWidth / 2;
-        int y = 30; // somewhere in the upper-middle, but above the crafting grid
+        int screenHeight = mc.getWindow().getGuiScaledHeight();
+
+        double xFraction = com.sabbs.fabricate.ModConfig.OVERLAY_X_FRACTION.get();
+        double yFraction = com.sabbs.fabricate.ModConfig.OVERLAY_Y_FRACTION.get();
+        double maxWidthFraction = com.sabbs.fabricate.ModConfig.OVERLAY_MAX_WIDTH_FRACTION.get();
+        float textScale = (float) (double) com.sabbs.fabricate.ModConfig.OVERLAY_TEXT_SCALE.get();
+
+        // Desired on-screen position (where the text center / top should land).
+        int screenX = (int) (screenWidth * xFraction);
+        int screenY = (int) (screenHeight * yFraction);
 
         int wrapWidth = Math.min(
             MAX_TEXT_WIDTH_PIXELS,
-            Math.max(120, (int) (screenWidth * MAX_TEXT_WIDTH_SCREEN_FRACTION))
+            Math.max(MIN_TEXT_WIDTH_PIXELS, (int) (screenWidth * maxWidthFraction))
         );
 
         Component styledTitle = title.copy().withStyle(ChatFormatting.RED, ChatFormatting.BOLD);
         Component styledDetail = detail.copy().withStyle(ChatFormatting.RED);
 
-        int nextY = drawWrappedCentered(graphics, mc, styledTitle, x, y, wrapWidth);
+        // Scale the pose so the font renders at textScale x its natural size.
+        // After scaling, drawing at (screenX/scale, screenY/scale) in scaled
+        // space lands the text at (screenX, screenY) in actual screen pixels.
+        com.mojang.blaze3d.vertex.PoseStack pose = graphics.pose();
+        pose.pushPose();
+        pose.scale(textScale, textScale, 1.0F);
+
+        int scaledX = Math.round(screenX / textScale);
+        int scaledY = Math.round(screenY / textScale);
+
+        int nextY = drawWrappedCentered(graphics, mc, styledTitle, scaledX, scaledY, wrapWidth);
 
         if (!detail.getString().isBlank()) {
-            drawWrappedCentered(graphics, mc, styledDetail, x, nextY + 2, wrapWidth);
+            drawWrappedCentered(graphics, mc, styledDetail, scaledX, nextY + 2, wrapWidth);
         }
+
+        pose.popPose();
     }
 
     /**
