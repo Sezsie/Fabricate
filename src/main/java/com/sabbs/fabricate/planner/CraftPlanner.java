@@ -142,6 +142,7 @@ public final class CraftPlanner {
 
             Map<Item, Integer> baseCost = new HashMap<>();
             Map<Item, Integer> byproducts = new HashMap<>();
+            Map<Item, Integer> toolDamage = new HashMap<>();
             List<CraftPlan.Step> steps = new ArrayList<>();
 
             boolean ok = resolve(
@@ -150,6 +151,7 @@ public final class CraftPlanner {
                 remainingInv,
                 baseCost,
                 byproducts,
+                toolDamage,
                 steps,
                 new HashSet<>(),
                 0,
@@ -159,7 +161,7 @@ public final class CraftPlanner {
 
             if (!ok) return Optional.empty();
 
-            return Optional.of(new CraftPlan(target, qty, steps, baseCost, byproducts));
+            return Optional.of(new CraftPlan(target, qty, steps, baseCost, byproducts, toolDamage));
         } catch (BudgetExceededException e) {
             com.sabbs.fabricate.Fabricate.LOGGER.debug(
                 "[FAB-planner] planning budget exceeded for {}x {}: {}",
@@ -179,6 +181,7 @@ public final class CraftPlanner {
     private boolean resolve(
         Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
+        Map<Item, Integer> toolDamage,
         List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
         Budget budget
     ) {
@@ -222,10 +225,11 @@ public final class CraftPlanner {
                 Map<Item, Integer> invSnap = new HashMap<>(remainingInv);
                 Map<Item, Integer> baseSnap = new HashMap<>(baseCost);
                 Map<Item, Integer> bpSnap = new HashMap<>(byproducts);
+                Map<Item, Integer> tdSnap = new HashMap<>(toolDamage);
                 int stepsSnap = steps.size();
 
                 if (tryRecipe(recipe, target, stillNeed, remainingInv, baseCost,
-                    byproducts, steps, visited, depth, has3x3, budget)) {
+                    byproducts, toolDamage, steps, visited, depth, has3x3, budget)) {
                     return true;
                 }
 
@@ -233,6 +237,7 @@ public final class CraftPlanner {
                 restore(remainingInv, invSnap);
                 restore(baseCost, baseSnap);
                 restore(byproducts, bpSnap);
+                restore(toolDamage, tdSnap);
                 while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
             }
 
@@ -256,6 +261,7 @@ public final class CraftPlanner {
     private boolean tryRecipe(
         RecipeEdge recipe, Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
+        Map<Item, Integer> toolDamage,
         List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
         Budget budget
     ) {
@@ -286,67 +292,114 @@ public final class CraftPlanner {
         Map<Item, Integer> invSnap = new HashMap<>(remainingInv);
         Map<Item, Integer> baseSnap = new HashMap<>(baseCost);
         Map<Item, Integer> bpSnap = new HashMap<>(byproducts);
+        Map<Item, Integer> tdSnap = new HashMap<>(toolDamage);
         int stepsSnap = steps.size();
 
         Map<Item, Integer> stepConsumed = new HashMap<>();
+
+        // Reusable items this recipe has already claimed for an earlier slot.
+        // Subtracted from byproducts visibility in Phase A so sibling slots
+        // can't double-dip the same tool that the recipe instructions show
+        // occupying a separate grid cell at the same time. Sub-recipes
+        // invoked from Phase B don't see this map, so they DO get to see
+        // the freshly-flushed tool in byproducts - which is the whole point
+        // of the immediate flush below (the consumption-timing fix).
+        Map<Item, Integer> reservedByThisRecipe = new HashMap<>();
 
         for (var entry : aggregated.entrySet()) {
             budget.checkTimeOnly();
 
             Set<Item> acceptedSet = entry.getKey();
             int needQty = entry.getValue();
+            Map<Item, Integer> consumedThisSlot = new HashMap<>();
 
             // Phase A: reuse from byproducts pool. Sibling slots from earlier
             // in this recipe may have produced waste this slot can consume.
+            // Items already reserved by an earlier sibling slot in THIS
+            // recipe are hidden so they can't be double-counted as sibling
+            // tools.
             for (Item candidate : acceptedSet) {
                 budget.checkTimeOnly();
 
                 if (needQty == 0) break;
-                int avail = byproducts.getOrDefault(candidate, 0);
+                int avail = byproducts.getOrDefault(candidate, 0)
+                    - reservedByThisRecipe.getOrDefault(candidate, 0);
                 if (avail <= 0) continue;
                 int use = Math.min(avail, needQty);
                 dec(byproducts, candidate, use);
                 stepConsumed.merge(candidate, use, Integer::sum);
+                consumedThisSlot.merge(candidate, use, Integer::sum);
                 needQty -= use;
             }
 
-            if (needQty == 0) continue;
+            if (needQty > 0) {
+                // Phase B: resolve the remaining need via inventory + recursion.
+                // Try accepted items in inventory-preferred order; resolve handles
+                // partial inventory takes + recipe recursion internally.
+                Item chosen = null;
+                int chosenQty = needQty;
 
-            // Phase B: resolve the remaining need via inventory + recursion.
-            // Try accepted items in inventory-preferred order; resolve handles
-            // partial inventory takes + recipe recursion internally.
-            Item chosen = null;
-            int chosenQty = needQty;
+                List<Item> orderedCandidates = preferredOrder(acceptedSet, remainingInv);
+                for (Item accepted : orderedCandidates) {
+                    budget.checkTimeOnly();
 
-            List<Item> orderedCandidates = preferredOrder(acceptedSet, remainingInv);
-            for (Item accepted : orderedCandidates) {
-                budget.checkTimeOnly();
-
-                if (resolve(accepted, needQty, remainingInv, baseCost, byproducts,
-                    steps, visited, depth + 1, has3x3, budget)) {
-                    chosen = accepted;
-                    break;
+                    if (resolve(accepted, needQty, remainingInv, baseCost, byproducts,
+                        toolDamage, steps, visited, depth + 1, has3x3, budget)) {
+                        chosen = accepted;
+                        break;
+                    }
                 }
+
+                if (chosen == null) {
+                    // No accepted item could be satisfied; abandon this recipe.
+                    restore(remainingInv, invSnap);
+                    restore(baseCost, baseSnap);
+                    restore(byproducts, bpSnap);
+                    restore(toolDamage, tdSnap);
+                    while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
+                    return false;
+                }
+
+                stepConsumed.merge(chosen, chosenQty, Integer::sum);
+                consumedThisSlot.merge(chosen, chosenQty, Integer::sum);
             }
 
-            if (chosen == null) {
-                // No accepted item could be satisfied; abandon this recipe.
-                restore(remainingInv, invSnap);
-                restore(baseCost, baseSnap);
-                restore(byproducts, bpSnap);
-                while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
-                return false;
+            // Consumption-timing fix: flush reusable-tool remainders to
+            // byproducts immediately at slot-end (not batched until end of
+            // recipe via addRecipeRemainders). This makes the tool visible
+            // to sub-recipes invoked by SUBSEQUENT sibling slots in this
+            // recipe.
+            //
+            // Without this, a recipe like "craft iron_ring (needs iron_rod
+            // + file)" calls resolve(iron_rod) AFTER the file slot has been
+            // satisfied. resolve(iron_rod) recurses into the iron_rod recipe
+            // which also needs a file - but at end-of-tryRecipe-timing, the
+            // file isn't in byproducts yet, so the sub-recipe goes hunting
+            // through the tag and either eats a higher-tier tool from
+            // inventory or exhausts the planning budget.
+            //
+            // The reservedByThisRecipe entry prevents sibling slots (which
+            // run their own Phase A) from treating this freshly-flushed
+            // tool as available - they still need their own tool, matching
+            // the recipe instructions.
+            for (var c : consumedThisSlot.entrySet()) {
+                Item it = c.getKey();
+                if (!IngredientHeuristics.isReusableItem(it)) continue;
+                int count = c.getValue();
+                byproducts.merge(it, count, Integer::sum);
+                reservedByThisRecipe.merge(it, count, Integer::sum);
             }
-
-            stepConsumed.merge(chosen, chosenQty, Integer::sum);
         }
 
         if (waste > 0) byproducts.merge(target, waste, Integer::sum);
 
         // Compute remainders via the recipe's own getRemainingItems, which
         // catches recipe-level overrides (GregTech hammers, modded tools)
-        // that the Item-level hasCraftingRemainingItem check misses.
-        addRecipeRemainders(recipe, stepConsumed, batches, byproducts);
+        // that the Item-level hasCraftingRemainingItem check misses. Also
+        // extracts the durability cost the recipe inflicts on reusable tools
+        // and accumulates it into toolDamage so the execute layer can damage
+        // the actual ItemStack instead of returning a pristine clone.
+        addRecipeRemainders(recipe, stepConsumed, batches, byproducts, toolDamage);
 
         steps.add(new CraftPlan.Step(recipe, batches, stepConsumed));
         return true;
@@ -368,9 +421,16 @@ public final class CraftPlanner {
      * <p>Falls back to the Item-level remainder check on any exception
      * (e.g. a position-sensitive override that doesn't like our arbitrary
      * placement, or a recipe class that NPEs on the null menu reference).
+     *
+     * <p>Reusable-tool remainders are SKIPPED here - they were already
+     * flushed to byproducts immediately at slot-end during {@link #tryRecipe}
+     * (the consumption-timing fix), so re-adding them here would double-
+     * count the tool. Only non-reusable remainders (empty buckets, glass
+     * bottles, etc.) are emitted at end-of-recipe.
      */
     private static void addRecipeRemainders(RecipeEdge edge, Map<Item, Integer> stepConsumed,
-                                            int batches, Map<Item, Integer> byproducts) {
+                                            int batches, Map<Item, Integer> byproducts,
+                                            Map<Item, Integer> toolDamage) {
         Recipe<?> raw = edge.sourceRecipe();
         if (!(raw instanceof net.minecraft.world.item.crafting.CraftingRecipe craftingRecipe)) {
             addItemLevelRemainders(stepConsumed, byproducts);
@@ -408,12 +468,24 @@ public final class CraftPlanner {
                 craftingRecipe.getRemainingItems(container);
             for (net.minecraft.world.item.ItemStack r : remainders) {
                 if (r.isEmpty()) continue;
-                // Mirror the per-batch math: reusable remainders (the tool
-                // itself) come back ONCE total because they were used once
-                // total. Non-reusable remainders (empty buckets, etc) come
-                // back once per batch.
-                int multiplier = IngredientHeuristics.isReusableItem(r.getItem()) ? 1 : batches;
-                byproducts.merge(r.getItem(), r.getCount() * multiplier, Integer::sum);
+                if (IngredientHeuristics.isReusableItem(r.getItem())) {
+                    // Reusable tools were already flushed to byproducts at
+                    // slot-end during tryRecipe (consumption-timing fix);
+                    // skip the byproduct re-add so we don't double-count.
+                    //
+                    // But: the recipe damaged the per-batch container's
+                    // pristine tool by r.getDamageValue() points per batch.
+                    // Accumulate total damage so the execute layer can apply
+                    // it to the player's actual tool stack.
+                    int dmgPerBatch = r.getDamageValue();
+                    if (dmgPerBatch > 0) {
+                        toolDamage.merge(r.getItem(), dmgPerBatch * batches, Integer::sum);
+                    }
+                    continue;
+                }
+                // Non-reusable remainders (empty buckets, glass bottles, etc.)
+                // come back once per batch, so scale by batches.
+                byproducts.merge(r.getItem(), r.getCount() * batches, Integer::sum);
             }
         } catch (Throwable t) {
             com.sabbs.fabricate.Fabricate.LOGGER.debug(
@@ -429,10 +501,15 @@ public final class CraftPlanner {
      * {@code Item.hasCraftingRemainingItem}) but misses recipe-level
      * overrides. Used when {@link #addRecipeRemainders} can't get a
      * working CraftingContainer.
+     *
+     * <p>Reusable-tool items are skipped here for the same reason as in
+     * {@link #addRecipeRemainders}: they were flushed immediately during
+     * {@link #tryRecipe} and re-adding would double-count.
      */
     private static void addItemLevelRemainders(Map<Item, Integer> stepConsumed, Map<Item, Integer> byproducts) {
         for (var e : stepConsumed.entrySet()) {
             Item item = e.getKey();
+            if (IngredientHeuristics.isReusableItem(item)) continue;
             if (!item.hasCraftingRemainingItem()) continue;
             Item remainder = item.getCraftingRemainingItem();
             if (remainder == null) continue;

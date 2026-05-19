@@ -154,13 +154,14 @@ public final class PlannerService {
         Map<Item, Integer> current = inventoryToMap(pInv);
 
         Fabricate.LOGGER.debug(
-            "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, currentInventory={}",
+            "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, toolDamage={}, currentInventory={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(plan.target()),
             plan.targetCount(),
             mode,
             formatItemMap(plan.baseCost()),
             formatItemMap(plan.byproducts()),
+            formatItemMap(plan.toolDamage()),
             formatItemMap(current)
         );
 
@@ -182,8 +183,24 @@ public final class PlannerService {
             }
         }
 
-        // Consume base cost slot-by-slot.
-        for (var entry : plan.baseCost().entrySet()) {
+        // Working copies of baseCost / byproducts so the tool-damage pre-pass
+        // can debit them without mutating the plan record.
+        Map<Item, Integer> baseCost = new HashMap<>(plan.baseCost());
+        Map<Item, Integer> byproducts = new HashMap<>(plan.byproducts());
+
+        // Pre-pass: apply durability damage to reusable tools in-place. For
+        // each (item, totalDamage) pair, the planner has also added one or
+        // more matching entries to baseCost AND byproducts (the loan-and-
+        // return accounting). Damaging the original stack and debiting both
+        // sides by the loan count keeps the player's stack identity intact:
+        // no shrink, no fresh clone, just the tool a little closer to
+        // breaking. If the planned damage would actually break the tool, we
+        // shrink the stack but still debit byproducts so we don't refund a
+        // pristine replacement.
+        applyToolDamage(player, plan.toolDamage(), baseCost, byproducts);
+
+        // Consume remaining base cost slot-by-slot.
+        for (var entry : baseCost.entrySet()) {
             Item item = entry.getKey();
             int toConsume = entry.getValue();
 
@@ -206,7 +223,7 @@ public final class PlannerService {
         }
 
         // Byproducts always go to inventory regardless of delivery mode.
-        for (var entry : plan.byproducts().entrySet()) {
+        for (var entry : byproducts.entrySet()) {
             giveOrDrop(player, entry.getKey(), entry.getValue());
         }
 
@@ -279,6 +296,112 @@ public final class PlannerService {
             player.getGameProfile().getName(),
             describeStack(player.containerMenu.getCarried())
         );
+    }
+
+    /**
+     * Apply planned durability damage to reusable tools currently in the
+     * player's inventory, in-place, before the normal baseCost/byproducts
+     * flow runs.
+     *
+     * <p>For each {@code (tool, totalDamage)} entry we:
+     * <ol>
+     *   <li>Compute how many tool instances this entry covers as
+     *       {@code loans = min(baseCost[tool], byproducts[tool])} - the
+     *       planner adds reusable tools to BOTH maps with the same count,
+     *       so the matched pair size is the number of "loans" we need to
+     *       reconcile.</li>
+     *   <li>Distribute {@code totalDamage} across that many real stacks,
+     *       splitting as evenly as possible (any leftover damage points
+     *       go to the first few stacks).</li>
+     *   <li>If the damage would equal or exceed {@code maxDamage}, the
+     *       stack is shrunk by 1 (the tool breaks) and is NOT returned.
+     *       Otherwise the stack's damage value is bumped and the stack
+     *       stays in place.</li>
+     *   <li>Either way, debit one count from both baseCost and byproducts
+     *       so the caller's shrink-and-refund flow doesn't double-handle
+     *       the same tool.</li>
+     * </ol>
+     *
+     * <p>Stacks with more than one item (rare for damageable items, but
+     * possible for some modded tools) are treated as a single stack -
+     * vanilla {@code ItemStack#setDamageValue} applies to the whole stack
+     * representation and we don't try to split it.
+     *
+     * <p>If the planner planned more loans than there are actual tool
+     * stacks in inventory (edge case: planner crafted a fresh tool that
+     * isn't here yet) the leftover damage is silently dropped. The total
+     * damage applied is at most {@code totalDamage} and the count debited
+     * is at most {@code loans}, so the normal flow correctly delivers the
+     * unrefunded fresh tool.
+     */
+    private static void applyToolDamage(
+        ServerPlayer player,
+        Map<Item, Integer> toolDamage,
+        Map<Item, Integer> baseCost,
+        Map<Item, Integer> byproducts
+    ) {
+        if (toolDamage == null || toolDamage.isEmpty()) {
+            return;
+        }
+
+        Inventory pInv = player.getInventory();
+
+        for (var entry : toolDamage.entrySet()) {
+            Item tool = entry.getKey();
+            int totalDamage = entry.getValue();
+            int loans = Math.min(
+                baseCost.getOrDefault(tool, 0),
+                byproducts.getOrDefault(tool, 0)
+            );
+
+            if (loans <= 0 || totalDamage <= 0) {
+                continue;
+            }
+
+            // Distribute damage as evenly as possible across the loaned tools.
+            int basePerTool = totalDamage / loans;
+            int extra = totalDamage % loans;
+            int remainingLoans = loans;
+
+            for (int i = 0; i < pInv.getContainerSize() && remainingLoans > 0; i++) {
+                ItemStack stack = pInv.getItem(i);
+                if (stack.isEmpty() || stack.getItem() != tool) continue;
+                if (!stack.isDamageableItem()) continue;
+
+                int dmg = basePerTool + (extra > 0 ? 1 : 0);
+                if (extra > 0) extra--;
+
+                int newDmg = stack.getDamageValue() + dmg;
+
+                if (newDmg >= stack.getMaxDamage()) {
+                    Fabricate.LOGGER.debug(
+                        "[FAB-exec] tool broke during craft: player={}, tool={}, slot={}, oldDamage={}, applied={}, max={}",
+                        player.getGameProfile().getName(),
+                        ForgeRegistries.ITEMS.getKey(tool),
+                        i,
+                        stack.getDamageValue(),
+                        dmg,
+                        stack.getMaxDamage()
+                    );
+                    stack.shrink(1);
+                } else {
+                    Fabricate.LOGGER.debug(
+                        "[FAB-exec] tool damaged in place: player={}, tool={}, slot={}, oldDamage={}, applied={}, newDamage={}",
+                        player.getGameProfile().getName(),
+                        ForgeRegistries.ITEMS.getKey(tool),
+                        i,
+                        stack.getDamageValue(),
+                        dmg,
+                        newDmg
+                    );
+                    stack.setDamageValue(newDmg);
+                }
+
+                dec(baseCost, tool, 1);
+                dec(byproducts, tool, 1);
+                remainingLoans--;
+            }
+        }
     }
 
     private static void giveOrDrop(ServerPlayer player, Item item, int total) {

@@ -16,18 +16,27 @@ import java.util.Map;
  * either inventory items or were produced by a prior step. The final step
  * always produces {@code targetCount} (or more, with any excess in
  * {@code byproducts}) of {@code target}.
+ *
+ * <p>{@code toolDamage} is the total durability cost the plan will inflict on
+ * each reusable tool item (hammer, file, buzzsaw, etc.). The execute layer
+ * uses this to damage the actual ItemStack in inventory instead of returning
+ * a pristine clone — so tools wear down naturally and eventually break.
+ * Tools that don't take durability damage (or aren't damageable items at all)
+ * simply don't appear in this map.
  */
 public record CraftPlan(
     Item target,
     int targetCount,
     List<Step> steps,
     Map<Item, Integer> baseCost,
-    Map<Item, Integer> byproducts
+    Map<Item, Integer> byproducts,
+    Map<Item, Integer> toolDamage
 ) {
     public CraftPlan {
         steps = List.copyOf(steps);
         baseCost = Map.copyOf(baseCost);
         byproducts = Map.copyOf(byproducts);
+        toolDamage = Map.copyOf(toolDamage);
     }
 
     /**

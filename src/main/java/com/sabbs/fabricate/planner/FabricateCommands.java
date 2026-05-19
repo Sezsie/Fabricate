@@ -100,6 +100,8 @@ public final class FabricateCommands {
         source.sendSuccess(() -> labeled("Base cost", formatCounts(plan.baseCost())), false);
         source.sendSuccess(() -> labeled("Byproducts",
             plan.byproducts().isEmpty() ? "(none)" : formatCounts(plan.byproducts())), false);
+        source.sendSuccess(() -> labeled("Tool damage",
+            plan.toolDamage().isEmpty() ? "(none)" : formatCounts(plan.toolDamage())), false);
         source.sendSuccess(() -> labeled("Steps", String.valueOf(plan.steps().size())), false);
         int i = 1;
         for (CraftPlan.Step step : plan.steps()) {

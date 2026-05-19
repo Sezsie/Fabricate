@@ -1,6 +1,9 @@
 package com.sabbs.fabricate.client;
 
+import java.util.List;
+
 import com.sabbs.fabricate.Fabricate;
+
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -11,8 +14,6 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
-
-import java.util.List;
 
 /**
  * Lightweight red text overlay shown above crafting/container screens when
