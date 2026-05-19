@@ -43,18 +43,33 @@ public class ModConfig {
      */
     public static final ForgeConfigSpec.DoubleValue OVERLAY_TEXT_SCALE;
 
+    /**
+     * Where craft-failure messages are delivered: as a red overlay above
+     * the active container screen, or as a chat message.
+     */
+    public static final ForgeConfigSpec.EnumValue<FailureDisplay> FAILURE_DISPLAY;
+
+    /**
+     * Delivery target for craft-failure messages.
+     */
+    public enum FailureDisplay {
+        /** Red text rendered above the active container screen. */
+        OVERLAY,
+        /** Normal chat message (visible from any screen, persists in chat log). */
+        CHAT
+    }
+
     static {
         ForgeConfigSpec.Builder clientBuilder = new ForgeConfigSpec.Builder();
         clientBuilder.comment("Client-side settings").push("client");
         CLIENT_ENABLED = clientBuilder
             .comment("Master switch for Fabricate's click-to-craft.",
-                     "Set to false to disable sidebar clicks and tell the server",
-                     "to reject craft requests from this player.")
+                     "Set to false to disable sidebar clicks, if this mod takes the fun out of crafting for you.")
             .define("enabled", true);
         clientBuilder.pop();
 
-        clientBuilder.comment("Failure overlay - placement and width of the red",
-                              "text shown when Fabricate can't craft the requested item.")
+        clientBuilder.comment("Failure overlay. Placement and width of the red",
+                              "text shown when Fabricate can't craft the requested item. Only works if failureDisplay is set to OVERLAY.")
             .push("overlay");
         OVERLAY_X_FRACTION = clientBuilder
             .comment("Horizontal position as a fraction of screen width.",
@@ -62,13 +77,11 @@ public class ModConfig {
             .defineInRange("xFraction", 0.5, 0.0, 1.0);
         OVERLAY_Y_FRACTION = clientBuilder
             .comment("Vertical position as a fraction of screen height.",
-                     "0.0 = top edge, 1.0 = bottom edge. Default sits just below",
-                     "the top of the screen so it doesn't overlap the inventory UI.")
+                     "0.0 = top edge, 1.0 = bottom edge.")
             .defineInRange("yFraction", 0.05, 0.0, 1.0);
         OVERLAY_MAX_WIDTH_FRACTION = clientBuilder
             .comment("Maximum width of the wrapped text as a fraction of screen width.",
-                     "Smaller values produce more line wrapping in a narrower column.",
-                     "Default 0.20 keeps messages compact next to the crafting UI.")
+                     "Smaller values produce more line wrapping in a narrower column.")
             .defineInRange("maxWidthFraction", 0.20, 0.05, 1.0);
         OVERLAY_TEXT_SCALE = clientBuilder
             .comment("Font scale multiplier. 1.0 is vanilla size, 2.0 is double,",
@@ -76,6 +89,13 @@ public class ModConfig {
                      "scale changes, so you may want to tweak maxWidthFraction",
                      "to match.")
             .defineInRange("textScale", 1.0, 0.5, 4.0);
+        FAILURE_DISPLAY = clientBuilder
+            .comment("Where craft-failure messages appear.",
+                     "OVERLAY = red text above the active crafting/container screen",
+                     "          (may overlap with modded UI).",
+                     "CHAT = standard chat message (persists in chat history,",
+                     "          visible from any screen).")
+            .defineEnum("failureDisplay", FailureDisplay.OVERLAY);
         clientBuilder.pop();
 
         CLIENT_SPEC = clientBuilder.build();

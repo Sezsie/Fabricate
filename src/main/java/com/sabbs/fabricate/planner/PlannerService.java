@@ -13,6 +13,8 @@ import net.minecraftforge.registries.ForgeRegistries;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -428,28 +430,51 @@ public final class PlannerService {
         }
     }
 
+    /** Max recursion depth for the failure-explanation walk. */
+    private static final int FAILURE_MAX_DEPTH = 8;
+
+    /**
+     * Wall-clock budget for one {@link #explainFailure} call. Failure messages
+     * run on the server thread right after a real craft attempt also failed,
+     * so we cap how much extra time we spend producing the explanation.
+     */
+    private static final long FAILURE_BUDGET_MS = 30L;
+
     /**
      * Build a short player-facing failure explanation for a failed craft request.
      *
-     * <p>This is intentionally conservative. It does not try to fully explain
-     * the recursive search tree. Instead, it looks at direct recipes producing
-     * the requested item and reports the closest actionable missing ingredient
-     * slots.
+     * <p>The explanation walks the recipe tree recursively, consuming what the
+     * player actually has at each level, and reports only the leaves it cannot
+     * satisfy. For a 3-redstone-torch + 3-stone comparator recipe where the
+     * player has 8 sticks + 2 redstone + 0 stone, the older single-level
+     * explanation said "Missing: 3x Redstone Torch, 3x Stone." The recursive
+     * walk instead reports "Missing: 1x Redstone, 3x Stone" - the actual base
+     * materials the player still needs to gather, with the partial inventory
+     * already factored in.
      *
-     * <p>Important: this dry-runs slot consumption against a temporary inventory
-     * copy. That matters for recipes with duplicate consumable ingredients.
+     * <p>The walk has three terminal conditions:
+     * <ul>
+     *   <li>An item has no crafting producers (true base material like stone
+     *       or redstone) - it is reported as itself.</li>
+     *   <li>A cycle is detected (item A's recipe needs item B whose recipe
+     *       needs item A) - the item is reported as itself.</li>
+     *   <li>The depth or time budget is exhausted - the item is reported
+     *       as itself.</li>
+     * </ul>
      *
-     * <p>Reusable tool-like ingredients are not consumed during this dry-run.
-     * This prevents batched recipes from incorrectly reporting "64x Saw" when
-     * the same returned tool can be reused across batches.
+     * <p>At each recursion step the resolver considers both "break this down
+     * via a recipe" and "give up and report the item as the shortfall," and
+     * picks whichever produces the smallest total raw-material count - except
+     * at the top level, where we always recurse (the target is the thing the
+     * player is asking to craft, so reporting "Missing: 1x Comparator" would
+     * be useless).
      *
-     * <p>Actionable missing-item messages are preferred over generic
-     * "looked affordable but failed" messages. This matters for modpacks like
-     * GregTech where one recipe candidate may look affordable by simple item
-     * identity, while another candidate reveals the useful truth: the player is
-     * missing a required tool.
+     * <p>Reusable tool slots are reported by tag label rather than recursed
+     * into. If the player is missing a hammer, "Missing: 1x #gtceu:tools/hammer"
+     * is more useful than walking down into one specific hammer's recipe.
      */
     public static FailureFeedback explainFailure(ServerPlayer player, Item target, int qty) {
+        boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
         Map<Item, Integer> inventory = inventoryToMap(player.getInventory());
         CraftGraph graph = getGraph(player.server);
 
@@ -467,39 +492,110 @@ public final class PlannerService {
             );
         }
 
-        MissingCandidate best = null;
-
+        // Workstation gate: at the 2x2 inventory grid the planner refuses 3x3
+        // recipes, so the failure-explainer must mirror that filter before
+        // walking the recipe tree. Otherwise the walker happily traverses a
+        // 3x3 recipe, sees that all the materials are present, and concludes
+        // "nothing missing" - while the real planner has already given up on
+        // the recipe entirely.
+        List<CraftGraph.RecipeEdge> usableProducers = new ArrayList<>(producers.size());
         for (CraftGraph.RecipeEdge edge : producers) {
-            MissingCandidate candidate = evaluateDirectRecipe(edge, qty, inventory);
-
-            if (candidate == null) {
-                continue;
-            }
-
-            if (isBetterCandidate(candidate, best)) {
-                best = candidate;
+            if (has3x3 || !edge.requiresCraftingTable()) {
+                usableProducers.add(edge);
             }
         }
 
-        if (best == null) {
+        if (usableProducers.isEmpty()) {
             return new FailureFeedback(
                 title,
-                Component.literal("A recipe exists, but Fabricate could not explain why it failed.")
+                Component.literal("Open a crafting table to craft " + targetName + ".")
             );
         }
 
-        return new FailureFeedback(title, Component.literal(best.message()));
+        long deadlineNanos = System.nanoTime() + FAILURE_BUDGET_MS * 1_000_000L;
+        Map<MissingIngredient, Integer> shortfall = resolveShortfallForRecipes(
+            usableProducers,
+            target,
+            Math.max(1, qty),
+            new HashMap<>(inventory),
+            graph,
+            deadlineNanos
+        );
+
+        if (shortfall == null || shortfall.isEmpty()) {
+            // Walker found nothing missing, but the real planner still refused
+            // the craft. Most likely a recipe-coverage gap or budget hit, not
+            // a workstation issue (we already filtered for that above).
+            return new FailureFeedback(
+                title,
+                Component.literal("All ingredients present, but no usable recipe path was found.")
+            );
+        }
+
+        return new FailureFeedback(
+            title,
+            Component.literal("Missing: " + formatMissingItems(shortfall))
+        );
     }
 
     /**
-     * Candidate explanation for a failed direct recipe.
+     * Top-level entry point for the shortfall walk that uses a pre-filtered
+     * list of producer recipes instead of {@code graph.getRecipesProducing}.
+     * Used by {@link #explainFailure} to respect workstation gating before
+     * the recursive walk runs.
      *
-     * @param score lower is better among candidates of the same kind
-     * @param actionable true when this message tells the player a concrete item
-     *                   or item class they are missing
-     * @param message message shown to the player
+     * <p>Click-to-craft semantics ("always craft one more, even if you
+     * already have some") mean the planner deliberately removes the target
+     * from its inventory copy before resolving. This walker mirrors that:
+     * if the player has 2 comparators in their inventory and asks for one
+     * more, we still walk the comparator recipe and report the materials
+     * they need to gather - we do NOT silently say "no shortfall, you have
+     * comparators already."
      */
-    private record MissingCandidate(int score, boolean actionable, String message) {}
+    private static Map<MissingIngredient, Integer> resolveShortfallForRecipes(
+        List<CraftGraph.RecipeEdge> producers,
+        Item target,
+        int qty,
+        Map<Item, Integer> inventory,
+        CraftGraph graph,
+        long deadlineNanos
+    ) {
+        // Mirror CraftPlanner.plan: exclude any of the target item already in
+        // inventory so we plan a fresh craft, not a "you already have one"
+        // no-op.
+        inventory.remove(target);
+
+        int need = Math.max(1, qty);
+
+        Set<Item> visited = new HashSet<>();
+        visited.add(target);
+
+        Map<MissingIngredient, Integer> bestShortfall = null;
+        int bestTotal = Integer.MAX_VALUE;
+
+        try {
+            for (CraftGraph.RecipeEdge recipe : producers) {
+                if (System.nanoTime() > deadlineNanos) break;
+
+                int outputPerBatch = Math.max(1, recipe.outputCount());
+                int batches = ceilDiv(need, outputPerBatch);
+
+                Map<Item, Integer> invCopy = new HashMap<>(inventory);
+                Map<MissingIngredient, Integer> shortfall =
+                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, 0, deadlineNanos);
+
+                int total = totalCount(shortfall);
+                if (total < bestTotal) {
+                    bestTotal = total;
+                    bestShortfall = shortfall;
+                }
+            }
+        } finally {
+            visited.remove(target);
+        }
+
+        return bestShortfall == null ? new HashMap<>() : bestShortfall;
+    }
 
     /**
      * A player-facing missing ingredient entry.
@@ -511,124 +607,225 @@ public final class PlannerService {
     private record MissingIngredient(String label, boolean reusable) {}
 
     /**
-     * Prefer actionable messages over generic diagnostic messages.
+     * Recursively figure out the smallest set of raw items the player would
+     * have to acquire to satisfy a need of {@code qty} of {@code item}, given
+     * a working copy of their {@code inventory}.
      *
-     * <p>This avoids the bad UX where a weird recipe that looked affordable
-     * by item identity wins with score 0 and hides a useful "Missing: 1x Saw"
-     * explanation from another recipe candidate.
-     */
-    private static boolean isBetterCandidate(MissingCandidate candidate, MissingCandidate currentBest) {
-        if (currentBest == null) {
-            return true;
-        }
-
-        if (candidate.actionable() != currentBest.actionable()) {
-            return candidate.actionable();
-        }
-
-        return candidate.score() < currentBest.score();
-    }
-
-    /**
-     * Evaluate one direct producer recipe and return a compact missing-ingredient
-     * explanation.
+     * <p>The {@code inventory} map IS mutated: when this method returns, items
+     * it consumed (either directly or transitively through a recipe) have
+     * been decremented. The caller passes a copy if it wants to preserve
+     * the original.
      *
-     * <p>This does not recurse. It answers the player-facing question:
-     * "For this recipe, what obvious ingredients are missing from my inventory?"
+     * <p>{@code isTopLevel} controls whether the "this item is the shortfall"
+     * fallback is considered against recipe candidates. At the top level the
+     * fallback is rejected, because the user is explicitly asking how to
+     * craft the target - they already know they need the target itself.
+     * At sub-levels the fallback wins ties (a base material reported as
+     * itself beats a longer chain through inter-craftable items).
+     *
+     * @return a shortfall map keyed by missing ingredient with positive counts,
+     *         or an empty map when the need is fully satisfiable.
      */
-    private static MissingCandidate evaluateDirectRecipe(
-        CraftGraph.RecipeEdge edge,
-        int requestedQty,
-        Map<Item, Integer> inventory
+    private static Map<MissingIngredient, Integer> resolveShortfall(
+        Item item,
+        int qty,
+        Map<Item, Integer> inventory,
+        CraftGraph graph,
+        Set<Item> visited,
+        int depth,
+        long deadlineNanos,
+        boolean isTopLevel
     ) {
-        int outputPerBatch = Math.max(1, edge.outputCount());
-        int batches = ceilDiv(Math.max(1, requestedQty), outputPerBatch);
+        if (qty <= 0) return new HashMap<>();
 
-        Map<Item, Integer> remaining = new HashMap<>(inventory);
-        Map<MissingIngredient, Integer> missing = new HashMap<>();
-        int missingSlots = 0;
+        // Phase 1: take from inventory.
+        int have = inventory.getOrDefault(item, 0);
+        int take = Math.min(have, qty);
+        if (take > 0) dec(inventory, item, take);
+        int need = qty - take;
+        if (need == 0) return new HashMap<>();
 
-        for (int batch = 0; batch < batches; batch++) {
-            for (CraftGraph.IngredientSlot slot : edge.inputs()) {
-                MissingIngredient ingredient = describeMissingIngredient(slot.acceptedItems());
-                boolean reusable = ingredient.reusable();
+        // Phase 2: terminal conditions - report the item itself.
+        boolean budgetExceeded = System.nanoTime() > deadlineNanos;
+        boolean depthExceeded = depth >= FAILURE_MAX_DEPTH;
+        boolean cycle = visited.contains(item);
+        List<CraftGraph.RecipeEdge> producers = graph.getRecipesProducing(item);
 
-                Item consumed = consumeOneAccepted(slot.acceptedItems(), remaining, reusable);
+        if (budgetExceeded || depthExceeded || cycle || producers.isEmpty()) {
+            return singleton(describeConcrete(item), need);
+        }
 
-                if (consumed != null) {
-                    continue;
+        // Phase 3: try producer recipes, pick the one yielding the lowest
+        // raw-material total. Sub-levels also keep "report self" as a
+        // candidate; the top level rejects it.
+        //
+        // UX rule: at sub-levels a recipe candidate is only preferred over
+        // "report self" if the walk under that recipe actually USED some
+        // inventory. A recipe whose ingredients are entirely missing and
+        // whose sub-recurses just push the shortfall deeper is a worse
+        // explanation than just naming the missing intermediate. So if the
+        // player has 1 stick and the torch slot needs 3, telling them
+        // "missing 2 sticks" is more useful than "missing 1 acacia log" -
+        // the stick-from-planks chain doesn't help when they have no planks
+        // OR logs to begin with.
+        Map<MissingIngredient, Integer> bestShortfall;
+        Map<Item, Integer> bestInventory;
+        int bestTotal;
+
+        if (isTopLevel) {
+            bestShortfall = null;
+            bestInventory = null;
+            bestTotal = Integer.MAX_VALUE;
+        } else {
+            bestShortfall = singleton(describeConcrete(item), need);
+            bestInventory = new HashMap<>(inventory);
+            bestTotal = need;
+        }
+
+        visited.add(item);
+        try {
+            for (CraftGraph.RecipeEdge recipe : producers) {
+                if (System.nanoTime() > deadlineNanos) break;
+
+                int outputPerBatch = Math.max(1, recipe.outputCount());
+                int batches = ceilDiv(need, outputPerBatch);
+
+                Map<Item, Integer> invCopy = new HashMap<>(inventory);
+                Map<Item, Integer> invBefore = new HashMap<>(invCopy);
+                Map<MissingIngredient, Integer> shortfall =
+                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, depth, deadlineNanos);
+
+                int total = totalCount(shortfall);
+                boolean consumedInventory = !invCopy.equals(invBefore);
+
+                // Top level: always pick the best recipe; we're committed to
+                // crafting the target. Sub level: a recipe only beats the
+                // "report self" fallback when it actually uses inventory.
+                boolean recipePrefers = isTopLevel
+                    ? total < bestTotal
+                    : consumedInventory && total < bestTotal;
+
+                if (recipePrefers) {
+                    bestTotal = total;
+                    bestShortfall = shortfall;
+                    bestInventory = invCopy;
                 }
-
-                if (reusable) {
-                    missing.putIfAbsent(ingredient, 1);
-                } else {
-                    missing.merge(ingredient, 1, Integer::sum);
-                }
-
-                missingSlots++;
             }
+        } finally {
+            visited.remove(item);
         }
 
-        if (missing.isEmpty()) {
-            String recipeId = edge.id() == null ? "unknown recipe" : edge.id().toString();
-
-            return new MissingCandidate(
-                Integer.MAX_VALUE,
-                false,
-                "Recipe " + recipeId + " looked affordable, but Fabricate still could not plan it."
-            );
+        if (bestShortfall == null) {
+            // Top-level with no usable recipe (shouldn't happen since we
+            // verified producers exist, but be safe).
+            return singleton(describeConcrete(item), need);
         }
 
-        return new MissingCandidate(
-            missingSlots,
-            true,
-            "Missing: " + formatMissingItems(missing)
-        );
+        // Commit the best path's inventory consumption back to the caller.
+        inventory.clear();
+        inventory.putAll(bestInventory);
+        return bestShortfall;
     }
 
     /**
-     * Consume one item that can satisfy this ingredient slot from a temporary
-     * inventory map.
-     *
-     * <p>Reusable tool-like ingredients are not decremented, because they are
-     * expected to be returned by the recipe and reused across batches.
-     *
-     * <p>Preference order:
-     * 1. Any accepted item already present, highest available count first.
-     * 2. Alphabetical display name as a stable tie-breaker.
+     * Compute the shortfall for one recipe attempt: aggregate the ingredient
+     * slots, take what's available from the working inventory copy, and
+     * recurse on whatever's still missing.
      */
-    private static Item consumeOneAccepted(
-        Set<Item> acceptedItems,
-        Map<Item, Integer> remaining,
-        boolean reusable
+    private static Map<MissingIngredient, Integer> evaluateRecipeShortfall(
+        CraftGraph.RecipeEdge recipe,
+        int batches,
+        Map<Item, Integer> invCopy,
+        CraftGraph graph,
+        Set<Item> visited,
+        int depth,
+        long deadlineNanos
     ) {
-        Item best = null;
-        int bestCount = 0;
+        Map<MissingIngredient, Integer> shortfall = new HashMap<>();
 
-        for (Item item : acceptedItems) {
-            int count = remaining.getOrDefault(item, 0);
+        // Aggregate identical-accepted-set slots so e.g. four "any plank"
+        // slots become one entry of qty=4 (or qty=1 for reusable-tool slots,
+        // which are shared across all batches of one recipe attempt).
+        Map<Set<Item>, Integer> aggregated = new LinkedHashMap<>();
+        for (CraftGraph.IngredientSlot slot : recipe.inputs()) {
+            int perSlot = IngredientHeuristics.isReusableSlot(slot.acceptedItems()) ? 1 : batches;
+            aggregated.merge(slot.acceptedItems(), perSlot, Integer::sum);
+        }
 
-            if (count <= 0) {
+        for (var entry : aggregated.entrySet()) {
+            if (System.nanoTime() > deadlineNanos) break;
+
+            Set<Item> acceptedSet = entry.getKey();
+            int slotNeed = entry.getValue();
+            boolean reusable = IngredientHeuristics.isReusableSlot(acceptedSet);
+
+            // Try to satisfy from inventory across all accepted items.
+            // Reusable slots are satisfied by ANY one matching item without
+            // decrementing - the tool is returned per the planner's
+            // remainder accounting.
+            if (reusable) {
+                boolean toolPresent = false;
+                for (Item candidate : acceptedSet) {
+                    if (invCopy.getOrDefault(candidate, 0) > 0) {
+                        toolPresent = true;
+                        break;
+                    }
+                }
+                if (toolPresent) continue;
+
+                // Missing tool: report by tag label (or by representative
+                // concrete name if no useful tag is shared).
+                MissingIngredient ing = describeMissingIngredient(acceptedSet);
+                shortfall.merge(ing, 1, Integer::max);
                 continue;
             }
 
-            if (best == null
-                || count > bestCount
-                || (count == bestCount && displayItem(item).compareToIgnoreCase(displayItem(best)) < 0)) {
-                best = item;
-                bestCount = count;
+            for (Item candidate : acceptedSet) {
+                if (slotNeed == 0) break;
+                int avail = invCopy.getOrDefault(candidate, 0);
+                if (avail <= 0) continue;
+                int useable = Math.min(avail, slotNeed);
+                dec(invCopy, candidate, useable);
+                slotNeed -= useable;
+            }
+
+            if (slotNeed > 0) {
+                Item representative = chooseRepresentativeMissingItem(acceptedSet);
+                if (representative == null) continue;
+
+                Map<MissingIngredient, Integer> sub = resolveShortfall(
+                    representative,
+                    slotNeed,
+                    invCopy,
+                    graph,
+                    visited,
+                    depth + 1,
+                    deadlineNanos,
+                    false
+                );
+                for (var s : sub.entrySet()) {
+                    shortfall.merge(s.getKey(), s.getValue(), Integer::sum);
+                }
             }
         }
 
-        if (best == null) {
-            return null;
-        }
+        return shortfall;
+    }
 
-        if (!reusable) {
-            dec(remaining, best, 1);
-        }
+    private static MissingIngredient describeConcrete(Item item) {
+        return new MissingIngredient(displayItem(item), false);
+    }
 
-        return best;
+    private static Map<MissingIngredient, Integer> singleton(MissingIngredient key, int value) {
+        Map<MissingIngredient, Integer> m = new HashMap<>();
+        m.put(key, value);
+        return m;
+    }
+
+    private static int totalCount(Map<MissingIngredient, Integer> m) {
+        int sum = 0;
+        for (int v : m.values()) sum += v;
+        return sum;
     }
 
     /**
