@@ -1,0 +1,72 @@
+name: Publish to Modrinth
+
+# Triggers whenever you publish a GitHub release:
+#   Releases -> Draft a new release -> Publish release
+# Drafting or editing a release does NOT trigger this - only "published".
+on:
+  release:
+    types: [published]
+
+# mc-publish needs write access to attach the built jar to the release.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build mod jar
+        run: ./gradlew build
+
+      # Strip a leading "v" from the tag so a "v1.0.2" tag becomes the
+      # Modrinth version number "1.0.2". If you tag without a "v" this is
+      # a harmless no-op.
+      - name: Resolve version number
+        id: version
+        run: echo "number=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+      - name: Publish to Modrinth and attach to GitHub release
+        uses: Kir-Antipov/mc-publish@v3.3
+        with:
+          # ---- Modrinth ----
+          # TODO: replace with your Modrinth project ID or slug
+          # (modrinth.com/mod/<slug>, or Settings -> General -> Project ID).
+          modrinth-id: REPLACE_WITH_MODRINTH_PROJECT_ID
+          modrinth-token: ${{ secrets.MODRINTH_TOKEN }}
+
+          # ---- GitHub release asset ----
+          # Providing the token makes mc-publish attach the jar(s) to the
+          # release that triggered this workflow.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # ---- What to upload ----
+          # Main reobf jar only; excludes -sources / -dev / -javadoc jars.
+          files: build/libs/!(*-@(dev|sources|javadoc|slim)).jar
+
+          # ---- Version metadata ----
+          name: Fabricate ${{ steps.version.outputs.number }}
+          version: ${{ steps.version.outputs.number }}
+          # Pre-release on GitHub -> uploaded as a "beta" on Modrinth.
+          version-type: ${{ github.event.release.prerelease && 'beta' || 'release' }}
+          # The GitHub release notes body becomes the Modrinth changelog.
+          changelog: ${{ github.event.release.body }}
+
+          # ---- Compatibility ----
+          loaders: forge
+          game-versions: 1.20.1
+          java: 17

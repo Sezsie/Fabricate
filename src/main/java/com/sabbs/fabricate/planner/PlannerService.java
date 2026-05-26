@@ -790,6 +790,31 @@ public final class PlannerService {
             }
 
             if (slotNeed > 0) {
+                // Tag-style slot (e.g. #minecraft:planks accepts any plank
+                // type): report the shortfall as the tag label itself
+                // instead of recursing into one alphabetically-chosen
+                // representative. Otherwise a 3-plank shortfall on a
+                // tag slot would render as "3x Acacia Planks" - misleading
+                // because the player could equally well supply any other
+                // plank type.
+                if (acceptedSet.size() > 1) {
+                    net.minecraft.tags.TagKey<Item> tag =
+                        IngredientHeuristics.findBestCommonTag(acceptedSet);
+                    if (tag != null
+                        && IngredientHeuristics.tagPriority(tag)
+                            <= IngredientHeuristics.USEFUL_TAG_PRIORITY_CUTOFF) {
+                        shortfall.merge(
+                            new MissingIngredient(IngredientHeuristics.labelOf(tag), false),
+                            slotNeed,
+                            Integer::sum
+                        );
+                        continue;
+                    }
+                }
+
+                // Singleton slot, or multi-item slot with no clean shared
+                // tag: recurse on the alphabetically-first item so the
+                // walker can break it down into base materials.
                 Item representative = chooseRepresentativeMissingItem(acceptedSet);
                 if (representative == null) continue;
 
@@ -831,23 +856,32 @@ public final class PlannerService {
     /**
      * Describe an ingredient slot using the most useful player-facing label.
      *
-     * <p><b>Tag labels are reserved for tool-class slots.</b> For e.g. a
-     * GregTech buzzsaw slot accepting any of N buzzsaw tiers, the message
-     * "Missing: 1x #gtceu:tools/buzz_saws" is much more informative than
-     * pointing at one specific buzzsaw the player might not even know
-     * exists. For non-tool slots (logs, planks, ingots, etc.) we use the
-     * representative concrete item name instead - "Oak Log" is clearer
-     * than something like "#minecraft:completes_find_tree_tutorial" that
-     * happens to be the alphabetically-first tag shared by all logs and
-     * survives {@link IngredientHeuristics#tagPriority}'s default class.
+     * <p>Tag labels are preferred whenever the shared tag scores well in
+     * {@link IngredientHeuristics#tagPriority}:
+     * <ul>
+     *   <li><b>Reusable tool slots</b> always prefer the tag (e.g.
+     *       "Missing: 1x #gtceu:tools/buzz_saws" instead of one specific
+     *       buzzsaw tier the player may not even own).</li>
+     *   <li><b>Non-reusable material slots</b> prefer a clean material tag
+     *       when one is available (e.g. "Missing: 3x #minecraft:planks"
+     *       instead of "3x Acacia Planks" - so a player holding birch
+     *       planks isn't told they need acacia specifically).</li>
+     * </ul>
+     *
+     * <p>If the best shared tag is junk-looking (vanilla internal markers
+     * like "#minecraft:completes_find_tree_tutorial") it scores past the
+     * cutoff and we fall back to the representative concrete item name.
      */
     private static MissingIngredient describeMissingIngredient(Set<Item> acceptedItems) {
         boolean reusable = IngredientHeuristics.isReusableSlot(acceptedItems);
 
-        if (reusable) {
-            String tagLabel = IngredientHeuristics.findBestCommonTagLabel(acceptedItems);
-            if (tagLabel != null) {
-                return new MissingIngredient(tagLabel, true);
+        net.minecraft.tags.TagKey<Item> tag = IngredientHeuristics.findBestCommonTag(acceptedItems);
+        if (tag != null) {
+            int priority = IngredientHeuristics.tagPriority(tag);
+            boolean tagIsUseful = reusable
+                || priority <= IngredientHeuristics.USEFUL_TAG_PRIORITY_CUTOFF;
+            if (tagIsUseful) {
+                return new MissingIngredient(IngredientHeuristics.labelOf(tag), reusable);
             }
         }
 

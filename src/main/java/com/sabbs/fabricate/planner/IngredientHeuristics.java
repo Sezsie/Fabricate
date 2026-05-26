@@ -60,6 +60,15 @@ public final class IngredientHeuristics {
     }
 
     /**
+     * Cutoff for "useful" tag priority. Tags scoring at or below this are
+     * considered clear enough to surface as a failure-message label even
+     * for non-tool slots (e.g. "#minecraft:planks" for a plank slot, so
+     * the player isn't told "Missing 3x Acacia Planks" when they actually
+     * have birch planks ready to go).
+     */
+    public static final int USEFUL_TAG_PRIORITY_CUTOFF = 20;
+
+    /**
      * Try to find a shared tag that describes this ingredient slot better
      * than a single arbitrary concrete item. Returns null when the slot
      * has one accepted item or accepted items share no common tags.
@@ -70,6 +79,17 @@ public final class IngredientHeuristics {
      * per-item check.
      */
     public static String findBestCommonTagLabel(Set<Item> acceptedItems) {
+        TagKey<Item> tag = findBestCommonTag(acceptedItems);
+        return tag == null ? null : labelOf(tag);
+    }
+
+    /**
+     * Same as {@link #findBestCommonTagLabel} but returns the raw
+     * {@link TagKey} so callers can also inspect its priority via
+     * {@link #tagPriority(TagKey)}. The label form is
+     * {@code "#namespace:path"} - call {@link #labelOf(TagKey)} to format.
+     */
+    public static TagKey<Item> findBestCommonTag(Set<Item> acceptedItems) {
         if (acceptedItems == null || acceptedItems.size() <= 1) return null;
 
         Set<TagKey<Item>> commonTags = null;
@@ -92,14 +112,61 @@ public final class IngredientHeuristics {
             .sorted(Comparator
                 .comparingInt(IngredientHeuristics::tagPriority)
                 .thenComparing(t -> t.location().toString()))
-            .map(tag -> "#" + tag.location())
             .findFirst()
             .orElse(null);
     }
 
+    /** Format a tag as the conventional {@code "#namespace:path"} label. */
+    public static String labelOf(TagKey<Item> tag) {
+        return "#" + tag.location();
+    }
+
+    /**
+     * Common-material tag paths whose names are clean nouns players will
+     * recognize on sight ("planks", "ingots", "wool"). Used by
+     * {@link #tagPriority} to score these above default-namespace tags so
+     * they win as failure-message labels.
+     */
+    private static final Set<String> CLEAN_MATERIAL_PATHS = Set.of(
+        "planks",
+        "logs",
+        "logs_that_burn",
+        "leaves",
+        "saplings",
+        "flowers",
+        "small_flowers",
+        "tall_flowers",
+        "wool",
+        "wools",
+        "carpets",
+        "beds",
+        "candles",
+        "dyes",
+        "ingots",
+        "nuggets",
+        "raw_materials",
+        "gems",
+        "ores",
+        "stones",
+        "sand",
+        "concrete",
+        "concrete_powder",
+        "wooden_slabs",
+        "wooden_stairs",
+        "wooden_fences",
+        "wooden_fence_gates",
+        "wooden_buttons",
+        "wooden_doors",
+        "wooden_trapdoors",
+        "wooden_pressure_plates"
+    );
+
     /**
      * Score for picking the most descriptive tag among several common to a
-     * slot. Lower is preferred. Tool-class names beat generic forge tags.
+     * slot. Lower is preferred. Tool-class names beat clean material tags,
+     * clean material tags beat generic forge/c tags, and obvious junk
+     * (vanilla internal markers like {@code completes_find_tree_tutorial})
+     * is ranked dead last.
      */
     public static int tagPriority(TagKey<Item> tag) {
         String id = tag.location().toString().toLowerCase(Locale.ROOT);
@@ -114,7 +181,22 @@ public final class IngredientHeuristics {
         if (path.contains("tool")) return 6;
         if (id.startsWith("gtceu:")) return 7;
         if (id.startsWith("forge:tools") || id.startsWith("c:tools")) return 8;
+
+        // Clean material tags ("planks", "logs", "ingots", ...) - readable
+        // noun labels that work great as "Missing: 1x #minecraft:planks"
+        // failure messages.
+        if (CLEAN_MATERIAL_PATHS.contains(path)) return 10;
+
         if (id.startsWith("forge:") || id.startsWith("c:")) return 20;
+
+        // Vanilla internal-state markers (e.g. minecraft:completes_*) are
+        // technically common tags but useless as a UI label. Bury them
+        // below the generic default so they only win if no real tag
+        // exists.
+        if (path.startsWith("completes_")
+            || path.startsWith("entity_")
+            || path.startsWith("creature_")) return 90;
+
         return 50;
     }
 
