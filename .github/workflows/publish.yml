@@ -1,4 +1,4 @@
-name: Publish to Modrinth
+name: Publish to Modrinth and CurseForge
 
 # Triggers whenever you publish a GitHub release:
 #   Releases -> Draft a new release -> Publish release
@@ -40,14 +40,19 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
 
-      - name: Publish to Modrinth and attach to GitHub release
+      - name: Publish to Modrinth, CurseForge, and attach to GitHub release
         uses: Kir-Antipov/mc-publish@v3.3
         with:
           # ---- Modrinth ----
-          # TODO: replace with your Modrinth project ID or slug
-          # (modrinth.com/mod/<slug>, or Settings -> General -> Project ID).
-          modrinth-id: REPLACE_WITH_MODRINTH_PROJECT_ID
+          # Slug taken from the modpage URL: modrinth.com/mod/fabricate_
+          modrinth-id: fabricate_
           modrinth-token: ${{ secrets.MODRINTH_TOKEN }}
+
+          # ---- CurseForge ----
+          # Numeric project ID from the "About Project" sidebar on
+          # curseforge.com/minecraft/mc-mods/fabricate-it.
+          curseforge-id: 1549672
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
 
           # ---- GitHub release asset ----
           # Providing the token makes mc-publish attach the jar(s) to the
@@ -61,9 +66,10 @@ jobs:
           # ---- Version metadata ----
           name: Fabricate ${{ steps.version.outputs.number }}
           version: ${{ steps.version.outputs.number }}
-          # Pre-release on GitHub -> uploaded as a "beta" on Modrinth.
+          # Pre-release on GitHub -> uploaded as a "beta" on both platforms.
           version-type: ${{ github.event.release.prerelease && 'beta' || 'release' }}
-          # The GitHub release notes body becomes the Modrinth changelog.
+          # The GitHub release notes body becomes the changelog on both
+          # Modrinth and CurseForge.
           changelog: ${{ github.event.release.body }}
 
           # ---- Compatibility ----
