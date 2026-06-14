@@ -41,27 +41,35 @@ public class PlannerCraftPacket {
     private final ResourceLocation targetItemId;
     private final int qty;
     private final boolean toCursor;
+    private final boolean upToMode;
 
     public PlannerCraftPacket(Item target, int qty, boolean toCursor) {
-        this(ForgeRegistries.ITEMS.getKey(target), qty, toCursor);
+        this(ForgeRegistries.ITEMS.getKey(target), qty, toCursor, false);
     }
 
-    private PlannerCraftPacket(ResourceLocation id, int qty, boolean toCursor) {
+    public PlannerCraftPacket(Item target, int qty, boolean toCursor, boolean upToMode) {
+        this(ForgeRegistries.ITEMS.getKey(target), qty, toCursor, upToMode);
+    }
+
+    private PlannerCraftPacket(ResourceLocation id, int qty, boolean toCursor, boolean upToMode) {
         this.targetItemId = id;
         this.qty = qty;
         this.toCursor = toCursor;
+        this.upToMode = upToMode;
     }
 
     public static void encode(PlannerCraftPacket msg, FriendlyByteBuf buf) {
         buf.writeResourceLocation(msg.targetItemId);
         buf.writeVarInt(msg.qty);
         buf.writeBoolean(msg.toCursor);
+        buf.writeBoolean(msg.upToMode);
     }
 
     public static PlannerCraftPacket decode(FriendlyByteBuf buf) {
         return new PlannerCraftPacket(
             buf.readResourceLocation(),
             buf.readVarInt(),
+            buf.readBoolean(),
             buf.readBoolean()
         );
     }
@@ -127,18 +135,22 @@ public class PlannerCraftPacket {
                     ? PlannerService.DeliveryMode.CURSOR_FIRST
                     : PlannerService.DeliveryMode.INVENTORY;
 
-                PlannerService.ExecuteResult result =
-                    PlannerService.planAndExecute(player, target, safeQty, mode);
+                PlannerService.ExecuteResult result = msg.upToMode
+                    ? PlannerService.planAndExecuteUpTo(player, target, safeQty, mode)
+                    : PlannerService.planAndExecute(player, target, safeQty, mode);
 
                 if (!result.ok()) {
-                    Fabricate.LOGGER.info("[FAB-packet] rejected request from {}: qty={}, target={}, mode={}, reason={}",
+                    Fabricate.LOGGER.info("[FAB-packet] rejected request from {}: qty={}, target={}, mode={}, craftMode={}, reason={}",
                         player.getGameProfile().getName(),
                         safeQty,
                         msg.targetItemId,
                         mode,
+                        msg.upToMode ? "UP_TO" : "BATCH",
                         result.reason());
 
-                    PlannerService.FailureFeedback feedback = PlannerService.explainFailure(player, target, safeQty);
+                    PlannerService.FailureFeedback feedback = msg.upToMode
+                        ? PlannerService.explainPartial(player, target, safeQty, result.reason())
+                        : PlannerService.explainFailure(player, target, safeQty);
                     NetworkHandler.sendToPlayer(player, new CraftFailurePacket(feedback.title(), feedback.detail()));
 
                     return;

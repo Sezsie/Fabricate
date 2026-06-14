@@ -63,10 +63,13 @@ public abstract class EmiRecipeFillerMixin {
             && qty == 1
             && screen != null;
 
-        Fabricate.LOGGER.debug("[FAB-EMI] performFill -> PlannerCraftPacket({}x {}, toCursor={})",
-            qty, itemStack.getItem(), toCursor);
+        boolean upToMode =
+            com.sabbs.fabricate.ModConfig.CRAFT_MODE.get() == com.sabbs.fabricate.ModConfig.CraftMode.UP_TO;
 
-        NetworkHandler.sendToServer(new PlannerCraftPacket(itemStack.getItem(), qty, toCursor));
+        Fabricate.LOGGER.debug("[FAB-EMI] performFill -> PlannerCraftPacket({}x {}, toCursor={}, upToMode={})",
+            qty, itemStack.getItem(), toCursor, upToMode);
+
+        NetworkHandler.sendToServer(new PlannerCraftPacket(itemStack.getItem(), qty, toCursor, upToMode));
         EmiCraftThrottle.markAccepted();
 
         cir.setReturnValue(true);

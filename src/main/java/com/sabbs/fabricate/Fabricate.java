@@ -39,6 +39,9 @@ public class Fabricate {
         LOGGER.info("[FAB] registering client config spec");
         ModLoadingContext.get().registerConfig(ModConfig.Type.CLIENT, com.sabbs.fabricate.ModConfig.CLIENT_SPEC);
 
+        LOGGER.info("[FAB] registering server config spec");
+        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, com.sabbs.fabricate.ModConfig.SERVER_SPEC);
+
         LOGGER.info("[FAB] registering network channel");
         NetworkHandler.register();
 

@@ -11,6 +11,19 @@ public class ModConfig {
 
     public static final ForgeConfigSpec CLIENT_SPEC;
 
+    public static final ForgeConfigSpec SERVER_SPEC;
+
+    /**
+     * Server-side toggle: when true, items inside an open Sophisticated
+     * Backpacks / Sophisticated Storage container count as available crafting
+     * materials (and may be consumed) in addition to the player's inventory.
+     *
+     * <p>This is a server config because it changes what the planner is
+     * allowed to source from. The recipe-viewer mixins don't need to know
+     * about it; the server reads it directly when building the material pool.
+     */
+    public static final ForgeConfigSpec.BooleanValue INCLUDE_BACKPACK_INVENTORY;
+
     /**
      * Client-side master switch. When false, sidebar clicks are ignored and
      * the opt-out flag is sent to the server so it rejects packets from
@@ -50,6 +63,12 @@ public class ModConfig {
     public static final ForgeConfigSpec.EnumValue<FailureDisplay> FAILURE_DISPLAY;
 
     /**
+     * How click-to-craft requests are fulfilled server-side when the player
+     * is short on materials.
+     */
+    public static final ForgeConfigSpec.EnumValue<CraftMode> CRAFT_MODE;
+
+    /**
      * Delivery target for craft-failure messages.
      */
     public enum FailureDisplay {
@@ -57,6 +76,26 @@ public class ModConfig {
         OVERLAY,
         /** Normal chat message (visible from any screen, persists in chat log). */
         CHAT
+    }
+
+    /**
+     * Behavior when the player can't fully complete the requested craft.
+     */
+    public enum CraftMode {
+        /**
+         * All-or-nothing: only craft when every required material is in
+         * inventory. On any shortfall, refuse the craft and surface the
+         * missing-ingredients message.
+         */
+        BATCH,
+        /**
+         * Best-effort: craft as far down the chain as inventory allows, then
+         * report what's still missing for the original target. Useful for
+         * modpack chains where some inputs come from non-crafting processes
+         * (smelters, machines) - the player gets the intermediates
+         * pre-assembled and only has to gather the rest.
+         */
+        UP_TO
     }
 
     static {
@@ -98,6 +137,38 @@ public class ModConfig {
             .defineEnum("failureDisplay", FailureDisplay.OVERLAY);
         clientBuilder.pop();
 
+        clientBuilder.comment("How click-to-craft handles partial inventories.")
+            .push("crafting");
+        CRAFT_MODE = clientBuilder
+            .comment("BATCH (default) = all-or-nothing. The whole recipe tree must",
+                     "                  be satisfiable from current inventory or the",
+                     "                  craft is refused.",
+                     "UP_TO           = best-effort. If the full recipe can't be",
+                     "                  crafted, the server still crafts whatever",
+                     "                  intermediates it can from your materials,",
+                     "                  then reports what's still needed for the",
+                     "                  final target. Useful for modpack chains",
+                     "                  where some inputs come from non-crafting",
+                     "                  processes (smelters, machines).")
+            .defineEnum("craftMode", CraftMode.BATCH);
+        clientBuilder.pop();
+
         CLIENT_SPEC = clientBuilder.build();
+
+        ForgeConfigSpec.Builder serverBuilder = new ForgeConfigSpec.Builder();
+        serverBuilder.comment("Server-side crafting behavior.").push("crafting");
+        INCLUDE_BACKPACK_INVENTORY = serverBuilder
+            .comment("When true, items inside any Sophisticated Backpack you can",
+                     "reach count as available materials and may be consumed when",
+                     "you click-to-craft. This includes backpacks in your inventory,",
+                     "hotbar, or offhand, AND backpacks worn in a Curios slot (e.g.",
+                     "the 'back' slot) if Curios is installed. The backpack does NOT",
+                     "need to be open, and no crafting upgrade is required. When",
+                     "false, only the player's own inventory is used.",
+                     "Has no effect if Sophisticated Backpacks is not installed.")
+            .define("includeBackpackInventory", true);
+        serverBuilder.pop();
+
+        SERVER_SPEC = serverBuilder.build();
     }
 }

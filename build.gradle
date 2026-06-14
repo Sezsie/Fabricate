@@ -23,7 +23,7 @@ mixin {
     config 'fabricate.mixins.json'
 }
 
-version = '1.0.2'
+version = '1.0.3'
 group = 'com.sabbs.fabricate'
 
 base {
@@ -89,6 +89,22 @@ dependencies {
     // Configured in-game config UI, dev-only. No API usage on our side.
     // 5180900 = Configured 2.2.3 for 1.20.1 Forge.
     runtimeOnly fg.deobf('curse.maven:configured-457570:5180900')
+
+    // Sophisticated Backpacks (+ its required Sophisticated Core library),
+    // dev-only for testing crafting-upgrade integration. The planner support
+    // is generic (vanilla CraftingContainer slot scan), so no compile-time
+    // API usage is needed. Bump these file IDs when retesting on newer builds.
+    //   sophisticated-backpacks 422301 -> 8181905 (3.24.45.1795, MC 1.20.1)
+    //   sophisticated-core      618298 -> 8181881 (1.3.39.1911,  MC 1.20.1)
+    runtimeOnly fg.deobf('curse.maven:sophisticated-core-618298:8181881')
+    runtimeOnly fg.deobf('curse.maven:sophisticated-backpacks-422301:8181905')
+
+    // Curios API, dev-only. Lets us source materials from a Sophisticated
+    // Backpack worn in a Curios slot (e.g. the "back" slot) in addition to the
+    // main inventory. Integration is import-free reflection (public methods on
+    // public classes), so no compile-time API usage is needed.
+    //   curios 309927 -> 6418456 (5.14.1+1.20.1, MC 1.20.1 Forge)
+    runtimeOnly fg.deobf('curse.maven:curios-309927:6418456')
 }
 
 jar {

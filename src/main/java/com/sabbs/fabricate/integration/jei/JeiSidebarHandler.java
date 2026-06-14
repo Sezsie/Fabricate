@@ -85,10 +85,13 @@ public final class JeiSidebarHandler {
             toCursor = event.getScreen() instanceof AbstractContainerScreen<?>;
         }
 
-        Fabricate.LOGGER.debug("[FAB-JEI] click -> PlannerCraftPacket({}x {}, toCursor={})",
-            qty, net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(target), toCursor);
+        boolean upToMode =
+            com.sabbs.fabricate.ModConfig.CRAFT_MODE.get() == com.sabbs.fabricate.ModConfig.CraftMode.UP_TO;
 
-        NetworkHandler.sendToServer(new PlannerCraftPacket(target, qty, toCursor));
+        Fabricate.LOGGER.debug("[FAB-JEI] click -> PlannerCraftPacket({}x {}, toCursor={}, upToMode={})",
+            qty, net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(target), toCursor, upToMode);
+
+        NetworkHandler.sendToServer(new PlannerCraftPacket(target, qty, toCursor, upToMode));
 
         markClientClickAccepted();
         swallowNextRelease = true;

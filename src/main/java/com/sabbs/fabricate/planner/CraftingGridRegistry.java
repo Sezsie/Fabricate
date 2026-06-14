@@ -93,6 +93,21 @@ public final class CraftingGridRegistry {
     public static boolean has3x3Access(ServerPlayer player) {
         AbstractContainerMenu menu = player.containerMenu;
 
+        // Sophisticated Backpacks: a carried backpack with a Crafting Upgrade
+        // grants a real 3x3 crafting table, so treat it as 3x3 access
+        // regardless of which menu is open (even the plain inventory screen).
+        // Its contents are already pooled into the player's materials by
+        // SophisticatedStorageAccess; this just lets 3x3 recipes through.
+        // Checked first because the InventoryMenu branch below would otherwise
+        // short-circuit to 2x2 for a closed backpack. Gated by the same server
+        // switch that controls backpack material sourcing.
+        if (com.sabbs.fabricate.ModConfig.INCLUDE_BACKPACK_INVENTORY.get()
+            && com.sabbs.fabricate.integration.sophisticated.SophisticatedStorageAccess
+                .hasCraftingUpgrade(player)) {
+            Fabricate.LOGGER.debug("[FAB-grid] 3x3 access granted via carried backpack crafting upgrade");
+            return true;
+        }
+
         /*
          * Fast, explicit vanilla paths. These also protect us if something ever
          * removes or changes the registry entry.
@@ -115,6 +130,29 @@ public final class CraftingGridRegistry {
                 has3x3);
 
             return has3x3;
+        }
+
+        // Generic detection: any menu that exposes a slot backed by a vanilla
+        // CraftingContainer has a real crafting grid. This catches modded
+        // grids that reuse vanilla's container without extending CraftingMenu,
+        // e.g. Sophisticated Backpacks' crafting upgrade, whose grid is backed
+        // by CraftingItemHandler (extends TransientCraftingContainer, which
+        // implements CraftingContainer). A 3x3 grid means >= 9 input slots.
+        int craftingInputSlots = 0;
+        for (net.minecraft.world.inventory.Slot slot : menu.slots) {
+            if (slot.container instanceof net.minecraft.world.inventory.CraftingContainer) {
+                craftingInputSlots++;
+            }
+        }
+        if (craftingInputSlots >= 9) {
+            Fabricate.LOGGER.debug("[FAB-grid] detected CraftingContainer-backed 3x3 grid: class={}, inputSlots={}",
+                menu.getClass().getName(), craftingInputSlots);
+            return true;
+        }
+        if (craftingInputSlots > 0) {
+            Fabricate.LOGGER.debug("[FAB-grid] CraftingContainer-backed grid too small for 3x3: class={}, inputSlots={}",
+                menu.getClass().getName(), craftingInputSlots);
+            return false;
         }
 
         // Compatibility fallback: name-substring match so likely modded

@@ -81,7 +81,7 @@ public final class PlannerService {
 
     /** Compute a {@link CraftPlan} for {@code target} from the player's inventory. */
     public static Optional<CraftPlan> plan(ServerPlayer player, Item target, int qty) {
-        Map<Item, Integer> inv = inventoryToMap(player.getInventory());
+        Map<Item, Integer> inv = buildMaterialMap(player);
         boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
 
         // Per-call detail (full inventory dump) at debug so the live log isn't
@@ -100,7 +100,7 @@ public final class PlannerService {
 
     /** Items currently craftable from the player's inventory. This is optimistic and quantity-light. */
     public static Set<Item> reachable(ServerPlayer player) {
-        return Reachability.compute(inventoryToMap(player.getInventory()), getGraph(player.server));
+        return Reachability.compute(buildMaterialMap(player), getGraph(player.server));
     }
 
     /** Where the target output goes after a successful execute. */
@@ -138,6 +138,210 @@ public final class PlannerService {
         return execute(player, p.get(), mode);
     }
 
+    /** Max iterations of the "craft an intermediate, retry the target" loop. */
+    private static final int UP_TO_MAX_ITERATIONS = 8;
+
+    /**
+     * Best-effort variant of {@link #planAndExecute}.
+     *
+     * <p>If the full plan succeeds, identical to the normal call. If the
+     * full plan fails, instead of giving up the planner tries to craft any
+     * intermediates the player's current inventory CAN support (e.g.
+     * crafting redstone torches from blocks + sticks, even though the
+     * top-level recipe also needs iron plates the player doesn't have).
+     *
+     * <p>Each round:
+     * <ol>
+     *   <li>Try the full target plan. If it succeeds, execute and return.</li>
+     *   <li>For each producer recipe of the target whose workstation gate
+     *       the player passes, look at every non-tool input slot. Compute
+     *       how short the player is on each, then ask the planner to make
+     *       just that shortfall.</li>
+     *   <li>If at least one intermediate got crafted, restart the loop -
+     *       maybe enough has changed for the top-level to now plan.</li>
+     *   <li>If nothing progressed, stop. The remaining shortfall is
+     *       reported via {@link #explainPartial}.</li>
+     * </ol>
+     *
+     * <p>The result code distinguishes three cases for the packet handler:
+     * <ul>
+     *   <li>{@code ok=true}: the target was eventually crafted.</li>
+     *   <li>{@code ok=false, reason="partial"}: some intermediates were
+     *       crafted but the target wasn't. The packet handler turns this
+     *       into a "Crafted X. Still missing Y" message via
+     *       {@link #explainPartial}.</li>
+     *   <li>{@code ok=false, reason="no plan"}: nothing could be made.
+     *       Same UX as a normal failure.</li>
+     * </ul>
+     */
+    public static ExecuteResult planAndExecuteUpTo(
+        ServerPlayer player,
+        Item target,
+        int qty,
+        DeliveryMode mode
+    ) {
+        // Fast path: the full plan works first try.
+        Optional<CraftPlan> direct = plan(player, target, qty);
+        if (direct.isPresent()) {
+            return execute(player, direct.get(), mode);
+        }
+
+        boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
+        CraftGraph graph = getGraph(player.server);
+        List<CraftGraph.RecipeEdge> producers = graph.getRecipesProducing(target);
+
+        if (producers.isEmpty()) {
+            Fabricate.LOGGER.info(
+                "[FAB-planner] up-to: no producer recipes for {} (player={})",
+                ForgeRegistries.ITEMS.getKey(target),
+                player.getGameProfile().getName()
+            );
+            return ExecuteResult.fail("no plan");
+        }
+
+        List<CraftedIntermediate> crafted = new ArrayList<>();
+        boolean progress = true;
+        int iter = 0;
+
+        while (progress && iter++ < UP_TO_MAX_ITERATIONS) {
+            progress = false;
+
+            for (CraftGraph.RecipeEdge recipe : producers) {
+                if (!has3x3 && recipe.requiresCraftingTable()) continue;
+
+                int outputPerBatch = Math.max(1, recipe.outputCount());
+                int batches = ceilDiv(qty, outputPerBatch);
+
+                // For each non-tool input slot, how short is the player?
+                // We only try to plan ONE item per slot per pass - the
+                // planner itself recurses through that item's sub-tree.
+                for (CraftGraph.IngredientSlot slot : recipe.inputs()) {
+                    if (IngredientHeuristics.isReusableSlot(slot.acceptedItems())) continue;
+
+                    Map<Item, Integer> inv = buildMaterialMap(player);
+                    int availableAcrossSet = 0;
+                    for (Item accepted : slot.acceptedItems()) {
+                        availableAcrossSet += inv.getOrDefault(accepted, 0);
+                    }
+                    int needed = batches;
+                    int shortfall = needed - availableAcrossSet;
+                    if (shortfall <= 0) continue;
+
+                    Item chosen = pickIntermediateCandidate(slot.acceptedItems(), inv);
+                    if (chosen == null) continue;
+
+                    // Don't try to "craft" the top-level target as one of
+                    // its own ingredients - that would loop.
+                    if (chosen == target) continue;
+
+                    Optional<CraftPlan> subPlan = plan(player, chosen, shortfall);
+                    if (subPlan.isEmpty()) continue;
+
+                    ExecuteResult subRes = execute(player, subPlan.get(), DeliveryMode.INVENTORY);
+                    if (subRes.ok()) {
+                        crafted.add(new CraftedIntermediate(chosen, shortfall));
+                        progress = true;
+
+                        Fabricate.LOGGER.debug(
+                            "[FAB-planner] up-to: crafted intermediate {}x {} for {}",
+                            shortfall,
+                            ForgeRegistries.ITEMS.getKey(chosen),
+                            ForgeRegistries.ITEMS.getKey(target)
+                        );
+                    }
+                }
+            }
+
+            // After each pass that made progress, re-try the top-level.
+            if (progress) {
+                Optional<CraftPlan> retry = plan(player, target, qty);
+                if (retry.isPresent()) {
+                    ExecuteResult finalRes = execute(player, retry.get(), mode);
+                    if (finalRes.ok()) {
+                        Fabricate.LOGGER.info(
+                            "[FAB-planner] up-to: completed {} via {} intermediate craft(s)",
+                            ForgeRegistries.ITEMS.getKey(target),
+                            crafted.size()
+                        );
+                        return finalRes;
+                    }
+                }
+            }
+        }
+
+        // We made some progress but couldn't finish. Stash the crafted list
+        // on the player for explainPartial to pick up.
+        LAST_PARTIAL.put(player.getUUID(), crafted);
+
+        Fabricate.LOGGER.info(
+            "[FAB-planner] up-to: partial - crafted {} intermediates, target {} still unreachable",
+            crafted.size(),
+            ForgeRegistries.ITEMS.getKey(target)
+        );
+
+        return crafted.isEmpty()
+            ? ExecuteResult.fail("no plan")
+            : ExecuteResult.fail("partial");
+    }
+
+    /**
+     * What was actually crafted on the way to the target, for
+     * {@link #explainPartial}'s message.
+     */
+    private record CraftedIntermediate(Item item, int qty) {}
+
+    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, List<CraftedIntermediate>> LAST_PARTIAL =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Pick which item out of an accepted-set the planner should try to
+     * craft as an intermediate. Prefers anything already partially in
+     * inventory (best chance of full satisfaction); otherwise the
+     * alphabetically-first item, for determinism.
+     */
+    private static Item pickIntermediateCandidate(Set<Item> acceptedItems, Map<Item, Integer> inv) {
+        Item bestInv = null;
+        int bestInvCount = 0;
+        for (Item item : acceptedItems) {
+            int c = inv.getOrDefault(item, 0);
+            if (c > bestInvCount) {
+                bestInvCount = c;
+                bestInv = item;
+            }
+        }
+        if (bestInv != null) return bestInv;
+
+        return acceptedItems.stream()
+            .min(Comparator.comparing(PlannerService::displayItem, String.CASE_INSENSITIVE_ORDER))
+            .orElse(null);
+    }
+
+    /**
+     * Build a "partial craft" feedback message after a UP_TO-mode call
+     * that crafted some intermediates but couldn't finish the target.
+     * Combines a list of what got crafted with the standard "still
+     * missing" walk against the player's now-updated inventory.
+     */
+    public static FailureFeedback explainPartial(ServerPlayer player, Item target, int qty, String reason) {
+        List<CraftedIntermediate> crafted = LAST_PARTIAL.remove(player.getUUID());
+        FailureFeedback standard = explainFailure(player, target, qty);
+
+        if (crafted == null || crafted.isEmpty()) {
+            return standard;
+        }
+
+        String craftedSummary = crafted.stream()
+            .map(c -> c.qty() + "x " + displayItem(c.item()))
+            .collect(Collectors.joining(", "));
+
+        Component title = Component.literal("Partial craft: " + displayItem(target));
+        Component detail = Component.literal(
+            "Crafted " + craftedSummary + ". "
+                + standard.detail().getString()
+        );
+        return new FailureFeedback(title, detail);
+    }
+
     /** Convenience overload. Target output goes to inventory. */
     public static ExecuteResult execute(ServerPlayer player, CraftPlan plan) {
         return execute(player, plan, DeliveryMode.INVENTORY);
@@ -153,7 +357,7 @@ public final class PlannerService {
      */
     public static ExecuteResult execute(ServerPlayer player, CraftPlan plan, DeliveryMode mode) {
         Inventory pInv = player.getInventory();
-        Map<Item, Integer> current = inventoryToMap(pInv);
+        Map<Item, Integer> current = buildMaterialMap(player);
 
         Fabricate.LOGGER.debug(
             "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, toolDamage={}, currentInventory={}",
@@ -201,7 +405,10 @@ public final class PlannerService {
         // pristine replacement.
         applyToolDamage(player, plan.toolDamage(), baseCost, byproducts);
 
-        // Consume remaining base cost slot-by-slot.
+        // Consume remaining base cost slot-by-slot. Player inventory first,
+        // then any reachable Sophisticated backpacks (carried or worn in a
+        // Curios slot) for the remainder - matching the order materials were
+        // offered to the planner.
         for (var entry : baseCost.entrySet()) {
             Item item = entry.getKey();
             int toConsume = entry.getValue();
@@ -214,6 +421,12 @@ public final class PlannerService {
                     stack.shrink(take);
                     toConsume -= take;
                 }
+            }
+
+            if (toConsume > 0 && com.sabbs.fabricate.ModConfig.INCLUDE_BACKPACK_INVENTORY.get()) {
+                int fromStorage = com.sabbs.fabricate.integration.sophisticated.SophisticatedStorageAccess
+                    .consume(player, item, toConsume);
+                toConsume -= fromStorage;
             }
         }
 
@@ -242,7 +455,11 @@ public final class PlannerService {
 
     /**
      * Places {@code qty} of {@code target} on the player's cursor, merging with
-     * any matching carried stack. Any overflow goes to inventory.
+     * any matching carried stack and filling it up to the stack limit. Any
+     * overflow that doesn't fit on the cursor is dropped on the ground (split
+     * into stack-sized drops), NOT routed into the inventory - cursor-delivery
+     * is a "give it to my hand" gesture, so the rest spills out rather than
+     * quietly filling backpack/inventory slots the player didn't ask to use.
      */
     private static void deliverToCursor(ServerPlayer player, Item target, int qty) {
         ItemStack output = new ItemStack(target, qty);
@@ -277,12 +494,12 @@ public final class PlannerService {
 
         if (!output.isEmpty()) {
             Fabricate.LOGGER.debug(
-                "[FAB-cursor] overflow, giving remainder to inventory: player={}, remainder={}",
+                "[FAB-cursor] overflow beyond cursor stack, dropping remainder on ground: player={}, remainder={}",
                 player.getGameProfile().getName(),
                 describeStack(output)
             );
 
-            giveOrDrop(player, output.getItem(), output.getCount());
+            dropOnGround(player, output.getItem(), output.getCount());
         }
 
         int stateId = player.containerMenu.incrementStateId();
@@ -430,6 +647,24 @@ public final class PlannerService {
         }
     }
 
+    /**
+     * Drops {@code total} of {@code item} on the ground at the player's feet,
+     * split into stack-sized drops (each up to the item's max stack size).
+     * Unlike {@link #giveOrDrop}, this never touches the inventory - used for
+     * cursor-delivery overflow, which the player asked to receive on the cursor
+     * rather than into storage.
+     */
+    private static void dropOnGround(ServerPlayer player, Item item, int total) {
+        int remaining = total;
+        int max = item.getMaxStackSize();
+
+        while (remaining > 0) {
+            int give = Math.min(remaining, max);
+            player.drop(new ItemStack(item, give), false);
+            remaining -= give;
+        }
+    }
+
     /** Max recursion depth for the failure-explanation walk. */
     private static final int FAILURE_MAX_DEPTH = 8;
 
@@ -475,7 +710,7 @@ public final class PlannerService {
      */
     public static FailureFeedback explainFailure(ServerPlayer player, Item target, int qty) {
         boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
-        Map<Item, Integer> inventory = inventoryToMap(player.getInventory());
+        Map<Item, Integer> inventory = buildMaterialMap(player);
         CraftGraph graph = getGraph(player.server);
 
         ResourceLocation targetId = ForgeRegistries.ITEMS.getKey(target);
@@ -920,6 +1155,29 @@ public final class PlannerService {
 
             if (!stack.isEmpty()) {
                 counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            }
+        }
+
+        return counts;
+    }
+
+    /**
+     * The full pool of materials available to {@code player}: their own
+     * inventory, plus the contents of any Sophisticated backpack they can reach
+     * - carried (open or closed) or worn in a Curios slot - when
+     * {@link com.sabbs.fabricate.ModConfig#INCLUDE_BACKPACK_INVENTORY}
+     * is enabled. This is the single source of truth for planning, the
+     * pre-execute availability check, and failure explanations, so they all
+     * agree on what the player can reach.
+     */
+    private static Map<Item, Integer> buildMaterialMap(ServerPlayer player) {
+        Map<Item, Integer> counts = inventoryToMap(player.getInventory());
+
+        if (com.sabbs.fabricate.ModConfig.INCLUDE_BACKPACK_INVENTORY.get()) {
+            Map<Item, Integer> storage =
+                com.sabbs.fabricate.integration.sophisticated.SophisticatedStorageAccess.readStorage(player);
+            for (var e : storage.entrySet()) {
+                counts.merge(e.getKey(), e.getValue(), Integer::sum);
             }
         }
 
