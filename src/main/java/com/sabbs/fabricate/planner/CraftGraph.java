@@ -12,6 +12,7 @@ import net.minecraft.world.item.crafting.RecipeType;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,10 +32,25 @@ import java.util.Set;
  */
 public final class CraftGraph {
 
-    /** A single ingredient slot. Accepts any one of {@code acceptedItems}. */
+    /**
+     * A single ingredient slot. Accepts any one of {@code acceptedItems}.
+     *
+     * <p>Iteration order is the order {@code Ingredient.getItems()} gave us -
+     * i.e. tag order, which conventionally lists the canonical item first
+     * ({@code minecraft:chest} before {@code minecraft:trapped_chest}). The
+     * planner leans on that when picking which accepted item to actually
+     * craft, so this must NOT be a plain {@code Set.copyOf}: that returns an
+     * ImmutableCollections.SetN whose iteration order is perturbed by a
+     * per-JVM-launch random salt, which both loses the tag's preference and
+     * makes the same click plan differently across restarts.
+     *
+     * <p>Equality is still order-insensitive (AbstractSet semantics), so
+     * slots with the same accepted items continue to aggregate together in
+     * the planner.
+     */
     public record IngredientSlot(Set<Item> acceptedItems) {
         public IngredientSlot {
-            acceptedItems = Set.copyOf(acceptedItems);
+            acceptedItems = java.util.Collections.unmodifiableSet(new LinkedHashSet<>(acceptedItems));
         }
         public boolean accepts(Item item) {
             return acceptedItems.contains(item);
@@ -85,7 +101,9 @@ public final class CraftGraph {
             List<IngredientSlot> slots = new ArrayList<>();
             for (Ingredient ing : recipe.getIngredients()) {
                 if (ing.isEmpty()) continue;
-                Set<Item> accepted = new HashSet<>();
+                // LinkedHashSet: preserve the ingredient's declared item
+                // order (see IngredientSlot) while still deduping.
+                Set<Item> accepted = new LinkedHashSet<>();
                 for (ItemStack is : ing.getItems()) {
                     if (!is.isEmpty()) accepted.add(is.getItem());
                 }

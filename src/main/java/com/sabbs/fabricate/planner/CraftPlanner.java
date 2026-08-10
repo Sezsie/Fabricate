@@ -6,6 +6,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.crafting.Recipe;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -73,6 +74,15 @@ public final class CraftPlanner {
      * operations is frequent enough to stop runaway searches quickly.
      */
     private static final int TIME_CHECK_INTERVAL = 64;
+
+    /**
+     * Slot width above which candidate cost-scoring is skipped.
+     *
+     * <p>{@link #derivedFromSibling} is O(candidates x producers x slots) per
+     * slot, which is fine for a chest tag but not for a 300-entry catch-all
+     * tag. Wide slots fall back to plain ingredient order.
+     */
+    private static final int MAX_SCORED_CANDIDATES = 32;
 
     private final CraftGraph graph;
     private final int maxDepth;
@@ -209,10 +219,10 @@ public final class CraftPlanner {
             return false;
         }
 
-        // Phase 3: try recipes for the shortfall.
+        // Phase 3: try recipes for the shortfall, exact-change routes first.
         visited.add(target);
         try {
-            for (RecipeEdge recipe : graph.getRecipesProducing(target)) {
+            for (RecipeEdge recipe : orderByExactChange(graph.getRecipesProducing(target), stillNeed)) {
                 budget.countRecipeAttempt(recipe, target, depth);
 
                 // Workstation gating: at a 2x2 inventory grid we can't
@@ -518,12 +528,66 @@ public final class CraftPlanner {
     }
 
     /**
+     * Order producer recipes so "exact change" routes are tried first.
+     *
+     * <p>A recipe whose output count divides {@code qty} evenly wastes
+     * nothing; one that overshoots dumps the excess into the byproduct pool,
+     * which ultimately lands in the player's inventory as clutter they never
+     * asked for. Asking for one crossbow shouldn't hand back a spare
+     * tripwire hook just because the hook recipe yields 2 and nothing else
+     * in the plan wanted the second one.
+     *
+     * <p>This is a <b>preference, not a filter</b>. Overshooting recipes stay
+     * in the list and still run when the exact-change route can't be
+     * satisfied from inventory - {@link #resolve} falls through to them
+     * exactly as before. The only change is which one gets tried first.
+     *
+     * <p>Side benefit: reversible N-to-N repack recipes are naturally
+     * deprioritized without needing to detect them. Resolving 1 iron ingot
+     * scores the 9-nuggets recipe at 0 overshoot and the unpack-a-block
+     * recipe at 8, so the planner stops shredding storage blocks when a
+     * tighter route exists - but still unpacks the block when that's all
+     * the player has.
+     *
+     * <p>Ties break on input-slot count (simpler recipes first), then on
+     * recipe id. That id tiebreak matters: the previous behavior took
+     * whatever {@code byOutput} insertion order gave it, which is datapack
+     * load order, so the same click could plan differently across restarts.
+     * Ordering is now deterministic for a given target and quantity.
+     *
+     * <p>Returns the input list untouched when there's nothing to reorder,
+     * which is the common case - most items have a single producer, and
+     * this runs inside the resolve hot loop.
+     */
+    private static List<RecipeEdge> orderByExactChange(List<RecipeEdge> producers, int qty) {
+        if (producers.size() <= 1) return producers;
+
+        List<RecipeEdge> ordered = new ArrayList<>(producers);
+        ordered.sort(Comparator
+            .comparingInt((RecipeEdge r) -> overshoot(r, qty))
+            .thenComparingInt(r -> r.inputs().size())
+            .thenComparing(r -> r.id().toString()));
+        return ordered;
+    }
+
+    /**
+     * How many surplus items running {@code recipe} enough times to cover
+     * {@code qty} would produce. Zero means exact change.
+     */
+    private static int overshoot(RecipeEdge recipe, int qty) {
+        int outputPerBatch = Math.max(1, recipe.outputCount());
+        return ceilDiv(qty, outputPerBatch) * outputPerBatch - qty;
+    }
+
+    /**
      * Sort accepted items so the ones already in inventory come first,
      * highest-count first (gives the planner the best shot at satisfying
      * needQty entirely from inventory). Items not in inventory follow in
-     * the accepted set's iteration order.
+     * the slot's ingredient order (tag order, canonical item first), with
+     * derived candidates pushed behind the things they're derived from -
+     * see {@link #derivedFromSibling}.
      */
-    private static List<Item> preferredOrder(Set<Item> accepted, Map<Item, Integer> remainingInv) {
+    private List<Item> preferredOrder(Set<Item> accepted, Map<Item, Integer> remainingInv) {
         List<Item> inInv = new ArrayList<>();
         List<Item> notInInv = new ArrayList<>();
         for (Item item : accepted) {
@@ -533,10 +597,56 @@ public final class CraftPlanner {
         inInv.sort((a, b) -> Integer.compare(
             remainingInv.getOrDefault(b, 0),
             remainingInv.getOrDefault(a, 0)));
+
+        // Stable sort on a 0/1 key: ties keep ingredient order, so this only
+        // demotes candidates we can prove are strictly more expensive.
+        if (notInInv.size() > 1 && accepted.size() <= MAX_SCORED_CANDIDATES) {
+            notInInv.sort(Comparator.comparingInt(i -> derivedFromSibling(i, accepted) ? 1 : 0));
+        }
+
         List<Item> ordered = new ArrayList<>(accepted.size());
         ordered.addAll(inInv);
         ordered.addAll(notInInv);
         return ordered;
+    }
+
+    /**
+     * Cheap "is this candidate strictly more expensive than another candidate
+     * in the same slot?" test: true when every recipe producing
+     * {@code candidate} consumes some <i>other</i> item this slot also
+     * accepts.
+     *
+     * <p>The motivating case is a hopper in a big modpack, where the chest
+     * slot is a tag ({@code forge:chests/wooden}) rather than a literal item.
+     * {@code trapped_chest} is craftable from {@code chest} + a tripwire hook,
+     * so picking it costs an extra iron ingot and stick for no benefit - but
+     * the search takes the first candidate that resolves and never compares
+     * costs. Requiring <i>all</i> producers to depend on a sibling keeps this
+     * conservative: a candidate with an independent recipe isn't demoted just
+     * because one of its recipes happens to be an upgrade path.
+     *
+     * <p>One level deep and short-circuited on the first miss. This runs
+     * inside the resolve hot loop, so it must stay cheap; deeper cost
+     * analysis belongs in a real cost-ranked search, not here.
+     */
+    private boolean derivedFromSibling(Item candidate, Set<Item> siblings) {
+        List<RecipeEdge> producers = graph.getRecipesProducing(candidate);
+        if (producers.isEmpty()) return false;
+
+        for (RecipeEdge producer : producers) {
+            boolean usesSibling = false;
+            for (IngredientSlot slot : producer.inputs()) {
+                for (Item sibling : siblings) {
+                    if (sibling != candidate && slot.accepts(sibling)) {
+                        usesSibling = true;
+                        break;
+                    }
+                }
+                if (usesSibling) break;
+            }
+            if (!usesSibling) return false;
+        }
+        return true;
     }
 
     private static void dec(Map<Item, Integer> map, Item item, int amount) {
