@@ -1,7 +1,6 @@
 package com.sabbs.fabricate.integration.emi;
 
 import com.sabbs.fabricate.Fabricate;
-import net.minecraftforge.common.MinecraftForge;
 
 /**
  * Isolated EMI initialization. The main mod class only touches this class
@@ -18,7 +17,6 @@ public final class EmiCompat {
 
     /** Called once from the main mod constructor if EMI is installed. */
     public static void init() {
-        MinecraftForge.EVENT_BUS.register(CraftingTableSidebarHandler.class);
         Fabricate.LOGGER.info("[FAB-EMI] EMI integration enabled");
     }
 }
