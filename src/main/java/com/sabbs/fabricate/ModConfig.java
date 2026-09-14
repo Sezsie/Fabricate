@@ -81,6 +81,12 @@ public class ModConfig {
     public static final ForgeConfigSpec.EnumValue<CraftMode> CRAFT_MODE;
 
     /**
+     * How a sidebar click turns into a craft. Governs whether Fabricate claims
+     * plain clicks or only ones made while the craft keybind is held.
+     */
+    public static final ForgeConfigSpec.EnumValue<CraftClickBehavior> CRAFT_CLICK_BEHAVIOR;
+
+    /**
      * Delivery target for craft-failure messages.
      */
     public enum FailureDisplay {
@@ -108,6 +114,25 @@ public class ModConfig {
          * pre-assembled and only has to gather the rest.
          */
         UP_TO
+    }
+
+    /**
+     * Whether a plain sidebar click crafts, or only a click made while the
+     * Fabricate craft keybind is held.
+     */
+    public enum CraftClickBehavior {
+        /**
+         * Default. A plain click passes straight through to JEI/EMI and any
+         * other mod (recipe view, ghost-drag into a Create item filter, a
+         * Create stock request, etc.). Hold the Fabricate craft key and click
+         * to craft. Nothing is consumed unless the key is held.
+         */
+        HOLD_KEY,
+        /**
+         * Legacy behavior: a plain click crafts and the click is consumed.
+         * Simple, but it blocks other mods' own handling of that click.
+         */
+        INTERCEPT_ALL
     }
 
     static {
@@ -163,6 +188,21 @@ public class ModConfig {
                      "                  where some inputs come from non-crafting",
                      "                  processes (smelters, machines).")
             .defineEnum("craftMode", CraftMode.BATCH);
+        clientBuilder.pop();
+
+        clientBuilder.comment("Click-to-craft activation.").push("controls");
+        CRAFT_CLICK_BEHAVIOR = clientBuilder
+            .comment("How a sidebar click becomes a craft.",
+                     "HOLD_KEY (default) = a plain click passes through to JEI/EMI",
+                     "                     and any other mod (recipe view, ghost-",
+                     "                     drag into Create item filters, Create",
+                     "                     stock requests, etc.). Hold the Fabricate",
+                     "                     craft key (default Left Alt, rebindable",
+                     "                     under Controls) and click to craft.",
+                     "INTERCEPT_ALL      = legacy behavior. A plain click crafts and",
+                     "                     is consumed, which can block other mods'",
+                     "                     handling of that click.")
+            .defineEnum("craftClickBehavior", CraftClickBehavior.HOLD_KEY);
         clientBuilder.pop();
 
         CLIENT_SPEC = clientBuilder.build();

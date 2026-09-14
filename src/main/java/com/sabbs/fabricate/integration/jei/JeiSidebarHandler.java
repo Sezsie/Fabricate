@@ -51,6 +51,13 @@ public final class JeiSidebarHandler {
         if (event.getButton() != 0) return;
         if (!com.sabbs.fabricate.ModConfig.CLIENT_ENABLED.get()) return;
 
+        // Unless we're actually going to craft, leave the click completely
+        // alone - don't resolve, don't swallow, don't cancel. This is what
+        // lets a plain click still view recipes and reach other mods (Create's
+        // ghost filters, stock requests). Only a held craft modifier (in the
+        // default HOLD_KEY mode) claims the click.
+        if (!com.sabbs.fabricate.client.FabricateActivation.shouldClaimClick()) return;
+
         IJeiRuntime rt = FabricateJeiPlugin.getRuntime();
         if (rt == null) return;
 
