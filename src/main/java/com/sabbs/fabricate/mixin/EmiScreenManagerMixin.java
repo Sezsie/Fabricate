@@ -51,7 +51,7 @@ public abstract class EmiScreenManagerMixin {
                                                    CallbackInfoReturnable<Boolean> cir) {
         if (!com.sabbs.fabricate.ModConfig.CLIENT_ENABLED.get()) return;
 
-        CraftIntent intent = detectIntent(button);
+        CraftIntent intent = resolveIntent(button);
         if (intent == null) return;
 
         Item hovered = resolveHoveredItem();
@@ -91,6 +91,33 @@ public abstract class EmiScreenManagerMixin {
         EmiCraftThrottle.markAccepted();
 
         cir.setReturnValue(false);
+    }
+
+    /**
+     * Decide what this click means, honoring the activation mode.
+     *
+     * <p>In the default {@code HOLD_KEY} mode a click is only claimed while
+     * the Fabricate craft modifier is held, and only a left click: modifier +
+     * left crafts one (to cursor in a container), modifier + shift + left
+     * crafts a full stack to inventory. Every other click (no modifier, right
+     * click, middle click) returns null and falls through to EMI, so recipe
+     * view, uses, and ghost-drag all keep working.
+     *
+     * <p>In {@code INTERCEPT_ALL} mode we defer to EMI's own configured craft
+     * binds via {@link #detectIntent}, matching the legacy behavior.
+     */
+    private static CraftIntent resolveIntent(int button) {
+        if (com.sabbs.fabricate.ModConfig.CRAFT_CLICK_BEHAVIOR.get()
+                == com.sabbs.fabricate.ModConfig.CraftClickBehavior.INTERCEPT_ALL) {
+            return detectIntent(button);
+        }
+
+        // HOLD_KEY: our own modifier-gated semantics, independent of EMI binds.
+        if (!com.sabbs.fabricate.client.FabricateActivation.isCraftModifierHeld()) return null;
+        if (button != 0) return null;
+        return net.minecraft.client.gui.screens.Screen.hasShiftDown()
+            ? CraftIntent.CRAFT_ALL_TO_INVENTORY
+            : CraftIntent.CRAFT_ONE_TO_CURSOR;
     }
 
     /** Mirrors EMI's priority: modified binds before plain binds. */
