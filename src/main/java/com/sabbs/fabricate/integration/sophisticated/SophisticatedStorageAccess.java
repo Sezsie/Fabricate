@@ -242,9 +242,10 @@ public final class SophisticatedStorageAccess {
         for (IItemHandler handler : backpackHandlers(player)) {
             for (int slot = 0; slot < handler.getSlots(); slot++) {
                 ItemStack stack = handler.getStackInSlot(slot);
-                if (!stack.isEmpty()) {
-                    counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+                if (stack.isEmpty() || com.sabbs.fabricate.ItemProtection.isProtected(stack)) {
+                    continue;
                 }
+                counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
             }
         }
         return counts;
@@ -261,7 +262,8 @@ public final class SophisticatedStorageAccess {
         for (IItemHandler handler : backpackHandlers(player)) {
             for (int slot = 0; slot < handler.getSlots() && remaining > 0; slot++) {
                 ItemStack stack = handler.getStackInSlot(slot);
-                if (stack.isEmpty() || stack.getItem() != item) {
+                if (stack.isEmpty() || stack.getItem() != item
+                    || com.sabbs.fabricate.ItemProtection.isProtected(stack)) {
                     continue;
                 }
                 ItemStack extracted = handler.extractItem(slot, remaining, false);

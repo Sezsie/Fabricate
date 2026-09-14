@@ -416,7 +416,10 @@ public final class PlannerService {
             for (int i = 0; i < pInv.getContainerSize() && toConsume > 0; i++) {
                 ItemStack stack = pInv.getItem(i);
 
-                if (stack.getItem() == item) {
+                // Skip protected stacks so we consume exactly what the planner
+                // saw as available - buildMaterialMap excluded these, so
+                // consuming one here would take an item the plan never counted.
+                if (stack.getItem() == item && !com.sabbs.fabricate.ItemProtection.isProtected(stack)) {
                     int take = Math.min(stack.getCount(), toConsume);
                     stack.shrink(take);
                     toConsume -= take;
@@ -586,6 +589,10 @@ public final class PlannerService {
                 ItemStack stack = pInv.getItem(i);
                 if (stack.isEmpty() || stack.getItem() != tool) continue;
                 if (!stack.isDamageableItem()) continue;
+                // Never wear down a protected tool. The planner excluded it
+                // from the material pool, so any loan being reconciled here
+                // belongs to an unprotected stack (or a freshly crafted one).
+                if (com.sabbs.fabricate.ItemProtection.isProtected(stack)) continue;
 
                 int dmg = basePerTool + (extra > 0 ? 1 : 0);
                 if (extra > 0) extra--;
@@ -1162,6 +1169,30 @@ public final class PlannerService {
     }
 
     /**
+     * Like {@link #inventoryToMap}, but excludes stacks that
+     * {@link com.sabbs.fabricate.ItemProtection#isProtected} refuses to let
+     * Fabricate consume (enchanted gear, etc.). This is what feeds the planner
+     * via {@link #buildMaterialMap}, so a protected stack is invisible to
+     * planning; the matching skip in {@link #execute} and
+     * {@link #applyToolDamage} keeps the two views in agreement.
+     */
+    private static Map<Item, Integer> materialInventoryToMap(Inventory inv) {
+        Map<Item, Integer> counts = new HashMap<>();
+
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+
+            if (stack.isEmpty() || com.sabbs.fabricate.ItemProtection.isProtected(stack)) {
+                continue;
+            }
+
+            counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+
+        return counts;
+    }
+
+    /**
      * The full pool of materials available to {@code player}: their own
      * inventory, plus the contents of any Sophisticated backpack they can reach
      * - carried (open or closed) or worn in a Curios slot - when
@@ -1171,7 +1202,7 @@ public final class PlannerService {
      * agree on what the player can reach.
      */
     private static Map<Item, Integer> buildMaterialMap(ServerPlayer player) {
-        Map<Item, Integer> counts = inventoryToMap(player.getInventory());
+        Map<Item, Integer> counts = materialInventoryToMap(player.getInventory());
 
         if (com.sabbs.fabricate.ModConfig.INCLUDE_BACKPACK_INVENTORY.get()) {
             Map<Item, Integer> storage =

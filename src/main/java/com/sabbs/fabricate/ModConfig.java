@@ -25,6 +25,18 @@ public class ModConfig {
     public static final ForgeConfigSpec.BooleanValue INCLUDE_BACKPACK_INVENTORY;
 
     /**
+     * Server-side toggle: when true, enchanted item stacks are never consumed
+     * or damaged by click-to-craft. Instead of eating your enchanted gear, the
+     * planner crafts a fresh item from base materials (or reports what's
+     * missing if it can't).
+     *
+     * <p>This is a server config because it changes what the planner is
+     * allowed to source from, exactly like {@link #INCLUDE_BACKPACK_INVENTORY}.
+     * The actual rule lives in {@link ItemProtection}.
+     */
+    public static final ForgeConfigSpec.BooleanValue PROTECT_ENCHANTED_ITEMS;
+
+    /**
      * Client-side master switch. When false, sidebar clicks are ignored and
      * the opt-out flag is sent to the server so it rejects packets from
      * this player.
@@ -167,6 +179,15 @@ public class ModConfig {
                      "false, only the player's own inventory is used.",
                      "Has no effect if Sophisticated Backpacks is not installed.")
             .define("includeBackpackInventory", true);
+        PROTECT_ENCHANTED_ITEMS = serverBuilder
+            .comment("When true, enchanted items are never consumed or damaged by",
+                     "click-to-craft. Fabricate crafts a fresh item from base",
+                     "materials instead of eating your enchanted gear. For example,",
+                     "a recipe needing a diamond pickaxe won't grab your Efficiency V",
+                     "pickaxe; it'll make a plain one from diamonds and sticks (or",
+                     "tell you what's still missing). Damaged-but-unenchanted tools",
+                     "are still used and worn down as normal.")
+            .define("protectEnchantedItems", true);
         serverBuilder.pop();
 
         SERVER_SPEC = serverBuilder.build();
