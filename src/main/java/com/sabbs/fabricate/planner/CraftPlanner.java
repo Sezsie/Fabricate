@@ -90,6 +90,14 @@ public final class CraftPlanner {
     private final int maxRecipeAttempts;
     private final long maxPlanTimeNanos;
 
+    /**
+     * Protected (enchanted) reusable tools the player owns, by count. Read only
+     * during a single {@link #plan} call and never mutated. Reusable slots may
+     * draw on these as a last resort when the normal pool can't supply the
+     * tool; they are worn but never consumed. Defaults to empty.
+     */
+    private Map<Item, Integer> protectedReusableTools = java.util.Map.of();
+
     public CraftPlanner(CraftGraph graph) {
         this(
             graph,
@@ -136,6 +144,20 @@ public final class CraftPlanner {
      * sticks-from-planks but not wooden_shovel (top-level OR intermediate).
      */
     public Optional<CraftPlan> plan(Item target, int qty, Map<Item, Integer> inventory, boolean has3x3) {
+        return plan(target, qty, inventory, has3x3, java.util.Map.of());
+    }
+
+    /**
+     * Full planning entry point that also accepts the player's protected
+     * (enchanted) reusable tools. Those are never consumed; a reusable slot may
+     * borrow one only as a last resort, when the normal material pool can
+     * neither supply nor craft the tool. See {@link CraftPlan#protectedToolDamage()}.
+     */
+    public Optional<CraftPlan> plan(Item target, int qty, Map<Item, Integer> inventory,
+                                    boolean has3x3, Map<Item, Integer> protectedReusableTools) {
+        this.protectedReusableTools =
+            protectedReusableTools == null ? java.util.Map.of() : protectedReusableTools;
+
         Budget budget = new Budget(
             target,
             qty,
@@ -153,6 +175,7 @@ public final class CraftPlanner {
             Map<Item, Integer> baseCost = new HashMap<>();
             Map<Item, Integer> byproducts = new HashMap<>();
             Map<Item, Integer> toolDamage = new HashMap<>();
+            Map<Item, Integer> protectedToolDamage = new HashMap<>();
             List<CraftPlan.Step> steps = new ArrayList<>();
 
             boolean ok = resolve(
@@ -162,6 +185,7 @@ public final class CraftPlanner {
                 baseCost,
                 byproducts,
                 toolDamage,
+                protectedToolDamage,
                 steps,
                 new HashSet<>(),
                 0,
@@ -171,7 +195,8 @@ public final class CraftPlanner {
 
             if (!ok) return Optional.empty();
 
-            return Optional.of(new CraftPlan(target, qty, steps, baseCost, byproducts, toolDamage));
+            return Optional.of(new CraftPlan(
+                target, qty, steps, baseCost, byproducts, toolDamage, protectedToolDamage));
         } catch (BudgetExceededException e) {
             com.sabbs.fabricate.Fabricate.LOGGER.debug(
                 "[FAB-planner] planning budget exceeded for {}x {}: {}",
@@ -191,7 +216,7 @@ public final class CraftPlanner {
     private boolean resolve(
         Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
-        Map<Item, Integer> toolDamage,
+        Map<Item, Integer> toolDamage, Map<Item, Integer> protectedToolDamage,
         List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
         Budget budget
     ) {
@@ -236,10 +261,11 @@ public final class CraftPlanner {
                 Map<Item, Integer> baseSnap = new HashMap<>(baseCost);
                 Map<Item, Integer> bpSnap = new HashMap<>(byproducts);
                 Map<Item, Integer> tdSnap = new HashMap<>(toolDamage);
+                Map<Item, Integer> pdSnap = new HashMap<>(protectedToolDamage);
                 int stepsSnap = steps.size();
 
                 if (tryRecipe(recipe, target, stillNeed, remainingInv, baseCost,
-                    byproducts, toolDamage, steps, visited, depth, has3x3, budget)) {
+                    byproducts, toolDamage, protectedToolDamage, steps, visited, depth, has3x3, budget)) {
                     return true;
                 }
 
@@ -248,6 +274,7 @@ public final class CraftPlanner {
                 restore(baseCost, baseSnap);
                 restore(byproducts, bpSnap);
                 restore(toolDamage, tdSnap);
+                restore(protectedToolDamage, pdSnap);
                 while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
             }
 
@@ -271,7 +298,7 @@ public final class CraftPlanner {
     private boolean tryRecipe(
         RecipeEdge recipe, Item target, int qty, Map<Item, Integer> remainingInv,
         Map<Item, Integer> baseCost, Map<Item, Integer> byproducts,
-        Map<Item, Integer> toolDamage,
+        Map<Item, Integer> toolDamage, Map<Item, Integer> protectedToolDamage,
         List<CraftPlan.Step> steps, Set<Item> visited, int depth, boolean has3x3,
         Budget budget
     ) {
@@ -303,9 +330,22 @@ public final class CraftPlanner {
         Map<Item, Integer> baseSnap = new HashMap<>(baseCost);
         Map<Item, Integer> bpSnap = new HashMap<>(byproducts);
         Map<Item, Integer> tdSnap = new HashMap<>(toolDamage);
+        Map<Item, Integer> pdSnap = new HashMap<>(protectedToolDamage);
         int stepsSnap = steps.size();
 
         Map<Item, Integer> stepConsumed = new HashMap<>();
+
+        // Reusable tools this recipe filled from the player's PROTECTED
+        // (enchanted) stock as a last resort. They go into stepConsumed so the
+        // recipe's remainder pass computes their wear, but they must never be
+        // booked into baseCost or byproducts: a protected tool is only damaged,
+        // never spent or refunded. Tracked so the flush skips them and
+        // addRecipeRemainders routes their wear into protectedToolDamage.
+        Set<Item> protectedLoans = new HashSet<>();
+        // Protected loans already claimed by an earlier slot in THIS recipe, so
+        // two sibling slots can't both borrow the player's single enchanted
+        // tool (checked against the owned count).
+        Map<Item, Integer> protectedClaimedThisRecipe = new HashMap<>();
 
         // Reusable items this recipe has already claimed for an earlier slot.
         // Subtracted from byproducts visibility in Phase A so sibling slots
@@ -342,6 +382,8 @@ public final class CraftPlanner {
                 needQty -= use;
             }
 
+            Item protectedChosenThisSlot = null;
+
             if (needQty > 0) {
                 // Phase B: resolve the remaining need via inventory + recursion.
                 // Try accepted items in inventory-preferred order; resolve handles
@@ -354,8 +396,27 @@ public final class CraftPlanner {
                     budget.checkTimeOnly();
 
                     if (resolve(accepted, needQty, remainingInv, baseCost, byproducts,
-                        toolDamage, steps, visited, depth + 1, has3x3, budget)) {
+                        toolDamage, protectedToolDamage, steps, visited, depth + 1, has3x3, budget)) {
                         chosen = accepted;
+                        break;
+                    }
+                }
+
+                // Phase B.5: protected-tool last resort. Only for reusable
+                // slots, and only after the normal pool failed to supply or
+                // craft the tool. Borrow an enchanted tool the player owns
+                // rather than fail the craft outright; it will be worn (never
+                // consumed, never broken) at execute. Consumable slots never
+                // reach here, so a protected item is never destroyed.
+                if (chosen == null && IngredientHeuristics.isReusableSlot(acceptedSet)) {
+                    for (Item candidate : acceptedSet) {
+                        int owned = protectedReusableTools.getOrDefault(candidate, 0);
+                        int claimed = protectedClaimedThisRecipe.getOrDefault(candidate, 0);
+                        if (owned - claimed <= 0) continue;
+                        chosen = candidate;
+                        protectedChosenThisSlot = candidate;
+                        protectedClaimedThisRecipe.merge(candidate, 1, Integer::sum);
+                        protectedLoans.add(candidate);
                         break;
                     }
                 }
@@ -366,10 +427,14 @@ public final class CraftPlanner {
                     restore(baseCost, baseSnap);
                     restore(byproducts, bpSnap);
                     restore(toolDamage, tdSnap);
+                    restore(protectedToolDamage, pdSnap);
                     while (steps.size() > stepsSnap) steps.remove(steps.size() - 1);
                     return false;
                 }
 
+                // A protected loan is booked into stepConsumed only (so its wear
+                // is computed), never into baseCost/byproducts - resolve was
+                // bypassed for it, so baseCost is already untouched.
                 stepConsumed.merge(chosen, chosenQty, Integer::sum);
                 consumedThisSlot.merge(chosen, chosenQty, Integer::sum);
             }
@@ -395,6 +460,11 @@ public final class CraftPlanner {
             for (var c : consumedThisSlot.entrySet()) {
                 Item it = c.getKey();
                 if (!IngredientHeuristics.isReusableItem(it)) continue;
+                // A protected loan is not a refundable byproduct: skip the flush
+                // so it never gets returned as a pristine clone, and don't
+                // reserve it as returnable stock. Sibling exclusivity for it is
+                // handled by protectedClaimedThisRecipe instead.
+                if (it.equals(protectedChosenThisSlot)) continue;
                 int count = c.getValue();
                 byproducts.merge(it, count, Integer::sum);
                 reservedByThisRecipe.merge(it, count, Integer::sum);
@@ -409,7 +479,8 @@ public final class CraftPlanner {
         // extracts the durability cost the recipe inflicts on reusable tools
         // and accumulates it into toolDamage so the execute layer can damage
         // the actual ItemStack instead of returning a pristine clone.
-        addRecipeRemainders(recipe, stepConsumed, batches, byproducts, toolDamage);
+        addRecipeRemainders(recipe, stepConsumed, batches, byproducts, toolDamage,
+            protectedToolDamage, protectedLoans);
 
         steps.add(new CraftPlan.Step(recipe, batches, stepConsumed));
         return true;
@@ -440,7 +511,9 @@ public final class CraftPlanner {
      */
     private static void addRecipeRemainders(RecipeEdge edge, Map<Item, Integer> stepConsumed,
                                             int batches, Map<Item, Integer> byproducts,
-                                            Map<Item, Integer> toolDamage) {
+                                            Map<Item, Integer> toolDamage,
+                                            Map<Item, Integer> protectedToolDamage,
+                                            Set<Item> protectedLoans) {
         Recipe<?> raw = edge.sourceRecipe();
         if (!(raw instanceof net.minecraft.world.item.crafting.CraftingRecipe craftingRecipe)) {
             addItemLevelRemainders(stepConsumed, byproducts);
@@ -489,7 +562,13 @@ public final class CraftPlanner {
                     // it to the player's actual tool stack.
                     int dmgPerBatch = r.getDamageValue();
                     if (dmgPerBatch > 0) {
-                        toolDamage.merge(r.getItem(), dmgPerBatch * batches, Integer::sum);
+                        // Route wear on a protected (enchanted) loan into its
+                        // own map; the execute layer damages it in place with a
+                        // no-break floor and never consumes or refunds it.
+                        Map<Item, Integer> dmgTarget = protectedLoans.contains(r.getItem())
+                            ? protectedToolDamage
+                            : toolDamage;
+                        dmgTarget.merge(r.getItem(), dmgPerBatch * batches, Integer::sum);
                     }
                     continue;
                 }

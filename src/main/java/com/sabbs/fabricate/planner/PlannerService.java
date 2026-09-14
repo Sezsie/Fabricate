@@ -82,20 +82,22 @@ public final class PlannerService {
     /** Compute a {@link CraftPlan} for {@code target} from the player's inventory. */
     public static Optional<CraftPlan> plan(ServerPlayer player, Item target, int qty) {
         Map<Item, Integer> inv = buildMaterialMap(player);
+        Map<Item, Integer> protectedTools = buildProtectedReusableTools(player);
         boolean has3x3 = CraftingGridRegistry.has3x3Access(player);
 
         // Per-call detail (full inventory dump) at debug so the live log isn't
         // flooded; outcome lines (no-plan / success / failure) stay at info.
         Fabricate.LOGGER.debug(
-            "[FAB-planner] planning request: player={}, target={}, qty={}, has3x3={}, inventory={}",
+            "[FAB-planner] planning request: player={}, target={}, qty={}, has3x3={}, inventory={}, protectedTools={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(target),
             qty,
             has3x3,
-            formatItemMap(inv)
+            formatItemMap(inv),
+            formatItemMap(protectedTools)
         );
 
-        return new CraftPlanner(getGraph(player.server)).plan(target, qty, inv, has3x3);
+        return new CraftPlanner(getGraph(player.server)).plan(target, qty, inv, has3x3, protectedTools);
     }
 
     /** Items currently craftable from the player's inventory. This is optimistic and quantity-light. */
@@ -360,7 +362,7 @@ public final class PlannerService {
         Map<Item, Integer> current = buildMaterialMap(player);
 
         Fabricate.LOGGER.debug(
-            "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, toolDamage={}, currentInventory={}",
+            "[FAB-exec] executing plan: player={}, target={}, targetCount={}, mode={}, baseCost={}, byproducts={}, toolDamage={}, protectedToolDamage={}, currentInventory={}",
             player.getGameProfile().getName(),
             ForgeRegistries.ITEMS.getKey(plan.target()),
             plan.targetCount(),
@@ -368,6 +370,7 @@ public final class PlannerService {
             formatItemMap(plan.baseCost()),
             formatItemMap(plan.byproducts()),
             formatItemMap(plan.toolDamage()),
+            formatItemMap(plan.protectedToolDamage()),
             formatItemMap(current)
         );
 
@@ -404,6 +407,12 @@ public final class PlannerService {
         // shrink the stack but still debit byproducts so we don't refund a
         // pristine replacement.
         applyToolDamage(player, plan.toolDamage(), baseCost, byproducts);
+
+        // Pre-pass for protected (enchanted) tools loaned to a reusable slot as
+        // a last resort. These are absent from baseCost/byproducts on purpose,
+        // so they bypass the consume-and-refund flow entirely: we only wear them
+        // in place, with a hard floor so a protected tool never breaks.
+        applyProtectedToolDamage(player, plan.protectedToolDamage());
 
         // Consume remaining base cost slot-by-slot. Player inventory first,
         // then any reachable Sophisticated backpacks (carried or worn in a
@@ -630,6 +639,64 @@ public final class PlannerService {
         }
     }
 
+    /**
+     * Wear protected (enchanted) tools that were loaned to a reusable slot as a
+     * last resort. Unlike {@link #applyToolDamage}, these never appear in
+     * {@code baseCost} or {@code byproducts}, so there is no loan pair to
+     * reconcile: we simply apply the damage in place to the real protected
+     * stack.
+     *
+     * <p><b>Never breaks.</b> The promise is that Fabricate does not destroy
+     * enchanted gear, and a tool that hits zero durability is destroyed. So the
+     * applied damage is clamped to leave at least one point of durability. If a
+     * protected tool is already at that floor, the leftover wear is silently
+     * dropped rather than breaking it. This is mildly non-vanilla (a tool that
+     * would have shattered instead survives at 1), and it only happens on a
+     * last-resort loan the player could avoid by carrying a plain tool or the
+     * mats to craft one.
+     *
+     * <p>Only {@link com.sabbs.fabricate.ItemProtection#isProtected protected}
+     * stacks are touched, matching what {@link #buildProtectedReusableTools}
+     * offered the planner.
+     */
+    private static void applyProtectedToolDamage(ServerPlayer player, Map<Item, Integer> protectedToolDamage) {
+        if (protectedToolDamage == null || protectedToolDamage.isEmpty()) {
+            return;
+        }
+
+        Inventory pInv = player.getInventory();
+
+        for (var entry : protectedToolDamage.entrySet()) {
+            Item tool = entry.getKey();
+            int remainingDamage = entry.getValue();
+            if (remainingDamage <= 0) continue;
+
+            for (int i = 0; i < pInv.getContainerSize() && remainingDamage > 0; i++) {
+                ItemStack stack = pInv.getItem(i);
+                if (stack.isEmpty() || stack.getItem() != tool) continue;
+                if (!stack.isDamageableItem()) continue;
+                if (!com.sabbs.fabricate.ItemProtection.isProtected(stack)) continue;
+
+                // Leave at least 1 point of durability so the tool never breaks.
+                int headroom = (stack.getMaxDamage() - 1) - stack.getDamageValue();
+                if (headroom <= 0) continue;
+
+                int applied = Math.min(headroom, remainingDamage);
+                Fabricate.LOGGER.debug(
+                    "[FAB-exec] protected tool worn in place: player={}, tool={}, slot={}, oldDamage={}, applied={}, max={}",
+                    player.getGameProfile().getName(),
+                    ForgeRegistries.ITEMS.getKey(tool),
+                    i,
+                    stack.getDamageValue(),
+                    applied,
+                    stack.getMaxDamage()
+                );
+                stack.setDamageValue(stack.getDamageValue() + applied);
+                remainingDamage -= applied;
+            }
+        }
+    }
+
     private static void giveOrDrop(ServerPlayer player, Item item, int total) {
         int remaining = total;
         int max = item.getMaxStackSize();
@@ -755,12 +822,17 @@ public final class PlannerService {
         }
 
         long deadlineNanos = System.nanoTime() + FAILURE_BUDGET_MS * 1_000_000L;
+        // Reusable slots the planner could satisfy from a protected (enchanted)
+        // tool aren't really "missing", so feed the walker the same last-resort
+        // pool the planner had.
+        Set<Item> protectedTools = buildProtectedReusableTools(player).keySet();
         Map<MissingIngredient, Integer> shortfall = resolveShortfallForRecipes(
             usableProducers,
             target,
             Math.max(1, qty),
             new HashMap<>(inventory),
             graph,
+            protectedTools,
             deadlineNanos
         );
 
@@ -800,6 +872,7 @@ public final class PlannerService {
         int qty,
         Map<Item, Integer> inventory,
         CraftGraph graph,
+        Set<Item> protectedTools,
         long deadlineNanos
     ) {
         // Mirror CraftPlanner.plan: exclude any of the target item already in
@@ -824,7 +897,7 @@ public final class PlannerService {
 
                 Map<Item, Integer> invCopy = new HashMap<>(inventory);
                 Map<MissingIngredient, Integer> shortfall =
-                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, 0, deadlineNanos);
+                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, protectedTools, 0, deadlineNanos);
 
                 int total = totalCount(shortfall);
                 if (total < bestTotal) {
@@ -874,6 +947,7 @@ public final class PlannerService {
         Map<Item, Integer> inventory,
         CraftGraph graph,
         Set<Item> visited,
+        Set<Item> protectedTools,
         int depth,
         long deadlineNanos,
         boolean isTopLevel
@@ -935,7 +1009,7 @@ public final class PlannerService {
                 Map<Item, Integer> invCopy = new HashMap<>(inventory);
                 Map<Item, Integer> invBefore = new HashMap<>(invCopy);
                 Map<MissingIngredient, Integer> shortfall =
-                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, depth, deadlineNanos);
+                    evaluateRecipeShortfall(recipe, batches, invCopy, graph, visited, protectedTools, depth, deadlineNanos);
 
                 int total = totalCount(shortfall);
                 boolean consumedInventory = !invCopy.equals(invBefore);
@@ -980,6 +1054,7 @@ public final class PlannerService {
         Map<Item, Integer> invCopy,
         CraftGraph graph,
         Set<Item> visited,
+        Set<Item> protectedTools,
         int depth,
         long deadlineNanos
     ) {
@@ -1008,7 +1083,10 @@ public final class PlannerService {
             if (reusable) {
                 boolean toolPresent = false;
                 for (Item candidate : acceptedSet) {
-                    if (invCopy.getOrDefault(candidate, 0) > 0) {
+                    // A protected (enchanted) tool counts as present here: the
+                    // planner can borrow it for a reusable slot as a last
+                    // resort, so it isn't really missing.
+                    if (invCopy.getOrDefault(candidate, 0) > 0 || protectedTools.contains(candidate)) {
                         toolPresent = true;
                         break;
                     }
@@ -1066,6 +1144,7 @@ public final class PlannerService {
                     invCopy,
                     graph,
                     visited,
+                    protectedTools,
                     depth + 1,
                     deadlineNanos,
                     false
@@ -1186,6 +1265,34 @@ public final class PlannerService {
                 continue;
             }
 
+            counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+
+        return counts;
+    }
+
+    /**
+     * Protected (enchanted) reusable tools the player is carrying, by item
+     * count. These are hidden from the normal material pool
+     * ({@link #materialInventoryToMap}) so they can never be consumed, but the
+     * planner may still borrow one for a reusable slot as a last resort - worn
+     * in place, never destroyed - rather than fail a craft when the enchanted
+     * tool is the only copy the player owns.
+     *
+     * <p>Main-inventory only for now: wearing a tool that lives inside a
+     * Sophisticated backpack in place needs a dedicated bridge method (and is
+     * tangled with the separate backpack-repair bug), so protected backpack
+     * tools stay hidden until that lands.
+     */
+    private static Map<Item, Integer> buildProtectedReusableTools(ServerPlayer player) {
+        Map<Item, Integer> counts = new HashMap<>();
+
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            if (!com.sabbs.fabricate.ItemProtection.isProtected(stack)) continue;
+            if (!IngredientHeuristics.isReusableItem(stack.getItem())) continue;
             counts.merge(stack.getItem(), stack.getCount(), Integer::sum);
         }
 
