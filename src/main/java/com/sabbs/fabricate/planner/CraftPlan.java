@@ -23,6 +23,14 @@ import java.util.Map;
  * a pristine clone — so tools wear down naturally and eventually break.
  * Tools that don't take durability damage (or aren't damageable items at all)
  * simply don't appear in this map.
+ *
+ * <p>{@code protectedToolDamage} is the durability cost for reusable tools that
+ * are {@link com.sabbs.fabricate.ItemProtection protected} (enchanted gear).
+ * These are loaned to a reusable slot only as a last resort, are never
+ * consumed, and are worn in place with a hard floor so they never actually
+ * break. They live in their own map because, unlike {@code toolDamage}, they
+ * are deliberately absent from {@code baseCost} and {@code byproducts}: a
+ * protected tool is only ever damaged, never spent or refunded.
  */
 public record CraftPlan(
     Item target,
@@ -30,13 +38,15 @@ public record CraftPlan(
     List<Step> steps,
     Map<Item, Integer> baseCost,
     Map<Item, Integer> byproducts,
-    Map<Item, Integer> toolDamage
+    Map<Item, Integer> toolDamage,
+    Map<Item, Integer> protectedToolDamage
 ) {
     public CraftPlan {
         steps = List.copyOf(steps);
         baseCost = Map.copyOf(baseCost);
         byproducts = Map.copyOf(byproducts);
         toolDamage = Map.copyOf(toolDamage);
+        protectedToolDamage = Map.copyOf(protectedToolDamage);
     }
 
     /**
